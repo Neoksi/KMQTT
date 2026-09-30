@@ -12,8 +12,8 @@ kotlin {
     explicitApi()
 
     jvm {
-        compilations.all {
-            kotlinOptions.jvmTarget = "1.8"
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8)
         }
     }
     js {
@@ -123,7 +123,7 @@ task("shadowJar", ShadowJar::class) {
     manifest.attributes["Main-Class"] = "MainKt"
     from(kotlin.targets["jvm"].compilations["main"].output)
     val runtimeClasspath =
-        (kotlin.targets["jvm"].compilations["main"] as org.jetbrains.kotlin.gradle.plugin.KotlinCompilationToRunnableFiles).runtimeDependencyFiles
+        kotlin.targets["jvm"].compilations["main"].runtimeDependencyFiles
     configurations = listOf(runtimeClasspath as Configuration)
 }
 
