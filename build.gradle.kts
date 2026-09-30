@@ -7,7 +7,7 @@ allprojects {
 
 buildscript {
     dependencies {
-        classpath("org.jetbrains.kotlinx:atomicfu-gradle-plugin:0.27.0")
+        classpath("org.jetbrains.kotlinx:atomicfu-gradle-plugin:0.33.0")
     }
 }
 
