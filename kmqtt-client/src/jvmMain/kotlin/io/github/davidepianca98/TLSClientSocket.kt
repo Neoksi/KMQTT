@@ -19,103 +19,167 @@ import java.security.spec.PKCS8EncodedKeySpec
 import java.util.*
 import javax.net.ssl.KeyManagerFactory
 import javax.net.ssl.SSLContext
+import javax.net.ssl.SSLEngine
 import javax.net.ssl.SSLEngineResult
 import javax.net.ssl.TrustManagerFactory
 import javax.net.ssl.X509TrustManager
 
 
-public actual class TLSClientSocket actual constructor(
-    address: String,
-    port: Int,
-    maximumPacketSize: Int,
-    private val readTimeOut: Int,
-    private val connectTimeOut: Int,
-    private val tlsSettings: TLSClientSettings,
-    checkCallback: () -> Unit
+public actual class TLSClientSocket private constructor(
+    connection: Connection,
+    private val readTimeOut: Int
 ) : TLSSocket(
-    SocketChannel.open().apply {
-        socket().connect(InetSocketAddress(address, port), connectTimeOut)
-        configureBlocking(false)
-    },
+    connection.channel,
     null,
-    ByteBuffer.allocate(maximumPacketSize),
-    ByteBuffer.allocate(maximumPacketSize),
-    ByteBuffer.allocate(maximumPacketSize),
-    ByteBuffer.allocate(maximumPacketSize),
-    SSLContext.getInstance(tlsSettings.version).apply {
-        val trustManagers = if (tlsSettings.serverCertificate != null) {
-            val certificate = CertificateFactory
-                .getInstance("X.509")
-                .generateCertificate(if (tlsSettings.serverCertificate!!.isValidPem()) tlsSettings.serverCertificate?.byteInputStream() else FileInputStream(tlsSettings.serverCertificate!!))
-
-            val keyStore = KeyStore.getInstance(KeyStore.getDefaultType())
-            keyStore.load(null, null)
-            keyStore.setCertificateEntry("server", certificate)
-
-            val trustManagerFactory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
-            trustManagerFactory.init(keyStore)
-
-            trustManagerFactory.trustManagers
-        } else {
-            if (!tlsSettings.checkServerCertificate) {
-                arrayOf(object : X509TrustManager {
-                    override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
-
-                    override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
-
-                    override fun getAcceptedIssuers(): Array<X509Certificate> {
-                        return arrayOf()
-                    }
-                })
-            } else {
-                null
-            }
-        }
-
-        val keyManagers = if (tlsSettings.clientCertificate != null) {
-            val certificate = CertificateFactory
-                .getInstance("X.509")
-                .generateCertificate(if (tlsSettings.clientCertificate!!.isValidPem()) tlsSettings.clientCertificate?.byteInputStream() else FileInputStream(tlsSettings.clientCertificate!!))
-
-            val keyStore = KeyStore.getInstance(KeyStore.getDefaultType())
-            keyStore.load(null, null)
-            val keyContent = if (tlsSettings.clientCertificateKey!!.isValidPem()) tlsSettings.clientCertificateKey!! else FileInputStream(tlsSettings.clientCertificateKey!!).bufferedReader().readText();
-            val key = try {
-                getRSAPrivateKeyFromString(keyContent)
-            } catch (e: InvalidKeySpecException) {
-                getECPrivateKeyFromString(keyContent)
-            }
-            keyStore.setKeyEntry("client", key, tlsSettings.clientCertificatePassword?.toCharArray(), arrayOf(certificate))
-
-            val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
-            kmf.init(keyStore, tlsSettings.clientCertificatePassword?.toCharArray())
-            kmf.keyManagers
-        } else {
-            null
-        }
-
-        init(keyManagers, trustManagers, null)
-    }.createSSLEngine().apply {
-        useClientMode = true
-    }
+    connection.sendBuffer,
+    connection.receiveBuffer,
+    connection.sendAppBuffer,
+    connection.receiveAppBuffer,
+    connection.engine
 ) {
-    private val selector = Selector.open()
+    /**
+     * Opens and connects the socket. Nothing is left open on failure: the SSL engine (certificates, keys) is created
+     * before the socket channel, a failed connect closes the channel, a failed handshake start or selector
+     * registration closes the socket.
+     */
+    public actual constructor(
+        address: String,
+        port: Int,
+        maximumPacketSize: Int,
+        readTimeOut: Int,
+        connectTimeOut: Int,
+        tlsSettings: TLSClientSettings,
+        checkCallback: () -> Unit
+    ) : this(connect(address, port, maximumPacketSize, connectTimeOut, tlsSettings), readTimeOut)
+
+    // Null until this class is initialized: TLSSocket's init may call close() before (failed handshake start)
+    private var selector: Selector? = null
 
     private val sendPacketQueue = mutableListOf<UByteArray>()
 
     init {
-        channel.register(selector, SelectionKey.OP_READ)
+        try {
+            val selector = Selector.open()
+            this.selector = selector
+            channel.register(selector, SelectionKey.OP_READ)
+        } catch (e: Throwable) {
+            close()
+            throw e
+        }
     }
 
     override fun close() {
         try {
             super.close()
         } finally {
-            selector.close()
+            selector?.close()
         }
     }
 
+    private class Connection(
+        val channel: SocketChannel,
+        val engine: SSLEngine,
+        maximumPacketSize: Int
+    ) {
+        val sendBuffer: ByteBuffer = ByteBuffer.allocate(maximumPacketSize)
+        val receiveBuffer: ByteBuffer = ByteBuffer.allocate(maximumPacketSize)
+        val sendAppBuffer: ByteBuffer = ByteBuffer.allocate(maximumPacketSize)
+        val receiveAppBuffer: ByteBuffer = ByteBuffer.allocate(maximumPacketSize)
+    }
+
     public companion object {
+        private fun connect(
+            address: String,
+            port: Int,
+            maximumPacketSize: Int,
+            connectTimeOut: Int,
+            tlsSettings: TLSClientSettings
+        ): Connection {
+            // Certificates and keys first: their errors must not leave an open socket behind
+            val engine = createEngine(tlsSettings)
+            val channel = openChannel(address, port, connectTimeOut)
+            try {
+                return Connection(channel, engine, maximumPacketSize)
+            } catch (e: Throwable) {
+                channel.close()
+                throw e
+            }
+        }
+
+        /** Connects [channel] (blocking, up to [connectTimeOut] ms) and makes it non-blocking; closes it on failure. */
+        internal fun openChannel(
+            address: String,
+            port: Int,
+            connectTimeOut: Int,
+            channel: SocketChannel = SocketChannel.open()
+        ): SocketChannel {
+            try {
+                channel.socket().connect(InetSocketAddress(address, port), connectTimeOut)
+                channel.configureBlocking(false)
+                return channel
+            } catch (e: Throwable) {
+                channel.close()
+                throw e
+            }
+        }
+
+        private fun createEngine(tlsSettings: TLSClientSettings): SSLEngine = SSLContext.getInstance(tlsSettings.version).apply {
+            val trustManagers = if (tlsSettings.serverCertificate != null) {
+                val certificate = CertificateFactory
+                    .getInstance("X.509")
+                    .generateCertificate(if (tlsSettings.serverCertificate!!.isValidPem()) tlsSettings.serverCertificate?.byteInputStream() else FileInputStream(tlsSettings.serverCertificate!!))
+
+                val keyStore = KeyStore.getInstance(KeyStore.getDefaultType())
+                keyStore.load(null, null)
+                keyStore.setCertificateEntry("server", certificate)
+
+                val trustManagerFactory = TrustManagerFactory.getInstance(TrustManagerFactory.getDefaultAlgorithm())
+                trustManagerFactory.init(keyStore)
+
+                trustManagerFactory.trustManagers
+            } else {
+                if (!tlsSettings.checkServerCertificate) {
+                    arrayOf(object : X509TrustManager {
+                        override fun checkClientTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+
+                        override fun checkServerTrusted(chain: Array<out X509Certificate>?, authType: String?) {}
+
+                        override fun getAcceptedIssuers(): Array<X509Certificate> {
+                            return arrayOf()
+                        }
+                    })
+                } else {
+                    null
+                }
+            }
+
+            val keyManagers = if (tlsSettings.clientCertificate != null) {
+                val certificate = CertificateFactory
+                    .getInstance("X.509")
+                    .generateCertificate(if (tlsSettings.clientCertificate!!.isValidPem()) tlsSettings.clientCertificate?.byteInputStream() else FileInputStream(tlsSettings.clientCertificate!!))
+
+                val keyStore = KeyStore.getInstance(KeyStore.getDefaultType())
+                keyStore.load(null, null)
+                val keyContent = if (tlsSettings.clientCertificateKey!!.isValidPem()) tlsSettings.clientCertificateKey!! else FileInputStream(tlsSettings.clientCertificateKey!!).bufferedReader().readText();
+                val key = try {
+                    getRSAPrivateKeyFromString(keyContent)
+                } catch (e: InvalidKeySpecException) {
+                    getECPrivateKeyFromString(keyContent)
+                }
+                keyStore.setKeyEntry("client", key, tlsSettings.clientCertificatePassword?.toCharArray(), arrayOf(certificate))
+
+                val kmf = KeyManagerFactory.getInstance(KeyManagerFactory.getDefaultAlgorithm())
+                kmf.init(keyStore, tlsSettings.clientCertificatePassword?.toCharArray())
+                kmf.keyManagers
+            } else {
+                null
+            }
+
+            init(keyManagers, trustManagers, null)
+        }.createSSLEngine().apply {
+            useClientMode = true
+        }
+
         private fun getRSAPrivateKeyFromString(key: String): RSAPrivateKey {
             val privateKeyPEM = key
                 .replace("-----BEGIN PRIVATE KEY-----", "")
@@ -156,6 +220,7 @@ public actual class TLSClientSocket actual constructor(
             }
         }
 
+        val selector = selector!!
         val count = selector.select(readTimeOut.toLong())
         return if (count > 0) {
             selector.selectedKeys().clear()
