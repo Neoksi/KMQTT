@@ -61,6 +61,10 @@ public class WebSocket(private val socket: SocketInterface, host: String, path: 
         socket.send(out.toByteArray())
     }
 
+    override fun wakeup() {
+        socket.wakeup()
+    }
+
     override fun sendRemaining() {
         socket.sendRemaining()
     }

@@ -47,6 +47,14 @@ public actual class ClientSocket actual constructor(
         }
     }
 
+    override fun wakeup() {
+        try {
+            selector.wakeup()
+        } catch (_: Exception) {
+            // Closed concurrently: nothing to wake up
+        }
+    }
+
     override fun read(): UByteArray? {
         val count = selector.select(readTimeOut.toLong())
         return if (count > 0) {

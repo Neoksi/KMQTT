@@ -76,6 +76,14 @@ public actual class TLSClientSocket private constructor(
         }
     }
 
+    override fun wakeup() {
+        try {
+            selector?.wakeup()
+        } catch (_: Exception) {
+            // Closed concurrently: nothing to wake up
+        }
+    }
+
     private class Connection(
         val channel: SocketChannel,
         val engine: SSLEngine,

@@ -64,6 +64,7 @@ import io.github.davidepianca98.socket.tls.TLSClientSettings
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.yield
+import kotlin.concurrent.Volatile
 
 /**
  * MQTT 3.1.1 and 5 client
@@ -87,6 +88,7 @@ import kotlinx.coroutines.yield
  * @param willQos the QoS of the will PUBLISH message
  * @param connackTimeout timeout in seconds after which the connection is closed if no CONNACK packet has been received
  * @param connectTimeout timeout in seconds after which an exception will be thrown if the socket is not able to establish a connection
+ * @param readTimeout how long in milliseconds one step() waits for data from the server (keep alive and CONNACK timeouts are checked once per step); wakeup() ends the wait earlier
  * @param enhancedAuthCallback the callback called when authenticationData is received, it should return the data necessary to continue authentication or null if completed (used only in MQTT5 if authenticationMethod has been set in the CONNECT properties)
  * @param onConnected called when the CONNACK packet has been received and the connection has been established
  * @param onDisconnected called when a DISCONNECT packet has been received or if the connection has been terminated
@@ -117,6 +119,7 @@ public class MQTTClient(
     private val willQos: Qos = Qos.AT_MOST_ONCE,
     private val connackTimeout: Int = 30,
     private val connectTimeout: Int = 30,
+    private val readTimeout: Int = 250,
     private val autoInit: Boolean = true,
     private val enhancedAuthCallback: (authenticationData: UByteArray?) -> UByteArray? = { null },
     private val onConnected: (connack: MQTTConnack) -> Unit = {},
@@ -133,6 +136,7 @@ public class MQTTClient(
     private val initialized: AtomicBoolean = atomic(false)
 
     private val maximumPacketSize = properties.maximumPacketSize?.toInt() ?: (1024 * 1024)
+    @Volatile
     private var socket: SocketInterface? = null
     private val running: AtomicBoolean = atomic(false)
 
@@ -192,7 +196,7 @@ public class MQTTClient(
             initialized.getAndSet(true)
             running.getAndSet(true)
 
-            connectSocket(250, connectTimeout * 1000)
+            connectSocket(readTimeout, connectTimeout * 1000)
         }
     }
 
@@ -212,6 +216,14 @@ public class MQTTClient(
     }
 
     public fun isInitialized(): Boolean = initialized.value
+
+    /**
+     * Ends the wait for data of a step() in progress (or of the next one), so that the thread running the client
+     * sends at once what other threads have queued for it. The only method safe to call from any thread.
+     */
+    public fun wakeup() {
+        socket?.wakeup()
+    }
 
     public fun isRunning(): Boolean = running.value
 
