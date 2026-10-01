@@ -90,9 +90,11 @@ import kotlinx.coroutines.yield
  * @param enhancedAuthCallback the callback called when authenticationData is received, it should return the data necessary to continue authentication or null if completed (used only in MQTT5 if authenticationMethod has been set in the CONNECT properties)
  * @param onConnected called when the CONNACK packet has been received and the connection has been established
  * @param onDisconnected called when a DISCONNECT packet has been received or if the connection has been terminated
- * @param onSubscribed called when a SUBACK packet has been received
+ * @param onSubscribed called when a SUBACK packet has been received (with failSessionOnSubackError = false: only when every subscription of it has been granted)
  * @param onUnsubscribed called when a UNSUBACK packet has been received
  * @param debugLog set to print the hex packets sent and received
+ * @param failSessionOnSubackError if true (default) a SUBACK refusing any subscription closes the connection and step() throws MQTTException; if false the connection stays open and onSubscribeFailed is called instead
+ * @param onSubscribeFailed called (only with failSessionOnSubackError = false) when a SUBACK refuses at least one subscription; its reason codes are in the order of the SUBSCRIBE topic filters
  * @param publishReceived called when a PUBLISH packet has been received
  */
 public class MQTTClient(
@@ -121,6 +123,8 @@ public class MQTTClient(
     private val onSubscribed: (suback: MQTTSuback) -> Unit = {},
     private val onUnsubscribed: (unsuback: MQTTUnsuback) -> Unit = {},
     private val debugLog: Boolean = false,
+    private val failSessionOnSubackError: Boolean = true,
+    private val onSubscribeFailed: (suback: MQTTSuback) -> Unit = {},
     private val publishReceived: (publish: MQTTPublish) -> Unit
 ) {
 
@@ -743,23 +747,27 @@ public class MQTTClient(
     }
 
     private fun handleSuback(packet: MQTTSuback) {
+        var refused: ReasonCode? = null
         if (packet is MQTT4Suback) {
-            for (reasonCode in packet.reasonCodes) {
-                if (reasonCode == SubackReturnCode.FAILURE) {
-                    throw MQTTException(ReasonCode.UNSPECIFIED_ERROR)
-                }
+            if (packet.reasonCodes.any { it == SubackReturnCode.FAILURE }) {
+                refused = ReasonCode.UNSPECIFIED_ERROR
             }
         } else if (packet is MQTT5Suback) {
             if (properties.requestProblemInformation == 0u && (packet.properties.reasonString != null || packet.properties.userProperty.isNotEmpty())) {
                 throw MQTTException(ReasonCode.PROTOCOL_ERROR)
             }
-            for (reasonCode in packet.reasonCodes) {
-                if (reasonCode != ReasonCode.SUCCESS && reasonCode != ReasonCode.GRANTED_QOS1 && reasonCode != ReasonCode.GRANTED_QOS2) {
-                    throw MQTTException(reasonCode)
-                }
+            refused = packet.reasonCodes.firstOrNull {
+                it != ReasonCode.SUCCESS && it != ReasonCode.GRANTED_QOS1 && it != ReasonCode.GRANTED_QOS2
             }
         }
-        onSubscribed(packet)
+        if (refused == null) {
+            onSubscribed(packet)
+        } else if (failSessionOnSubackError) {
+            throw MQTTException(refused)
+        } else {
+            // A refused subscription (e.g. ACL) does not affect the other subscriptions nor the connection
+            onSubscribeFailed(packet)
+        }
     }
 
     private fun handleUnsuback(packet: MQTTUnsuback) {
