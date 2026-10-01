@@ -95,6 +95,7 @@ import kotlinx.coroutines.yield
  * @param debugLog set to print the hex packets sent and received
  * @param failSessionOnSubackError if true (default) a SUBACK refusing any subscription closes the connection and step() throws MQTTException; if false the connection stays open and onSubscribeFailed is called instead
  * @param onSubscribeFailed called (only with failSessionOnSubackError = false) when a SUBACK refuses at least one subscription; its reason codes are in the order of the SUBSCRIBE topic filters
+ * @param onPublishAcknowledged called when a PUBACK acknowledges a QoS 1 PUBLISH sent by this client (its packetId is the one returned by publish()); in MQTT5 a reason code >= 0x80 means the server refused the message
  * @param publishReceived called when a PUBLISH packet has been received
  */
 public class MQTTClient(
@@ -125,6 +126,7 @@ public class MQTTClient(
     private val debugLog: Boolean = false,
     private val failSessionOnSubackError: Boolean = true,
     private val onSubscribeFailed: (suback: MQTTSuback) -> Unit = {},
+    private val onPublishAcknowledged: (puback: MQTTPuback) -> Unit = {},
     private val publishReceived: (publish: MQTTPublish) -> Unit
 ) {
 
@@ -304,8 +306,9 @@ public class MQTTClient(
      * @param topic the topic of the message
      * @param payload the content of the message
      * @param properties the properties to be included in the message (used only in MQTT5)
+     * @return the packet Id (QoS 1 and 2: acknowledged by onPublishAcknowledged for QoS 1), null for QoS 0
      */
-    public fun publish(retain: Boolean, qos: Qos, topic: String, payload: UByteArray?, properties: MQTT5Properties = MQTT5Properties()) {
+    public fun publish(retain: Boolean, qos: Qos, topic: String, payload: UByteArray?, properties: MQTT5Properties = MQTT5Properties()): UInt? {
         if (!connackReceived.value && properties.authenticationData != null) {
             throw Exception("Not sending until connection complete")
         }
@@ -340,6 +343,7 @@ public class MQTTClient(
             throw Exception("Packet size too big for the server to handle")
         }
         send(data)
+        return packetId
     }
 
     /**
@@ -697,8 +701,11 @@ public class MQTTClient(
         if (packet is MQTT5Puback && properties.requestProblemInformation == 0u && (packet.properties.reasonString != null || packet.properties.userProperty.isNotEmpty())) {
             throw MQTTException(ReasonCode.PROTOCOL_ERROR)
         }
-        lock.withLock {
+        val acknowledged = lock.withLock {
             pendingAcknowledgeMessages.remove(packet.packetId)
+        }
+        if (acknowledged != null) {
+            onPublishAcknowledged(packet)
         }
     }
 
