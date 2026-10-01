@@ -577,11 +577,9 @@ public class MQTTClient(
     private fun handleConnack(packet: MQTTConnack) {
         if (packet is MQTT5Connack) {
             if (packet.connectReasonCode != ReasonCode.SUCCESS) {
-                if ((packet.connectReasonCode == ReasonCode.USE_ANOTHER_SERVER || packet.connectReasonCode == ReasonCode.SERVER_MOVED) && packet.properties.serverReference != null) {
-                    // TODO if reason code 0x9C try to connect to the given server (4.11 format)
-                } else {
-                    throw MQTTException(packet.connectReasonCode)
-                }
+                // Any reason code other than SUCCESS refuses the connection: USE_ANOTHER_SERVER/SERVER_MOVED included,
+                // with or without serverReference (the client does not follow redirections)
+                throw MQTTException(packet.connectReasonCode)
             }
 
             val receiveMax = packet.properties.receiveMaximum ?: 65535u
