@@ -107,6 +107,14 @@ public actual class TLSClientSocket actual constructor(
         channel.register(selector, SelectionKey.OP_READ)
     }
 
+    override fun close() {
+        try {
+            super.close()
+        } finally {
+            selector.close()
+        }
+    }
+
     public companion object {
         private fun getRSAPrivateKeyFromString(key: String): RSAPrivateKey {
             val privateKeyPEM = key

@@ -24,12 +24,26 @@ public actual class ClientSocket actual constructor(
     private val selector = Selector.open()
 
     init {
-        channel.socket().connect(InetSocketAddress(address, port), connectTimeOut)
-        channel.configureBlocking(false)
-        channel.register(selector, SelectionKey.OP_READ)
+        try {
+            channel.socket().connect(InetSocketAddress(address, port), connectTimeOut)
+            channel.configureBlocking(false)
+            channel.register(selector, SelectionKey.OP_READ)
 
-        if (!channel.isConnected) {
-            throw Exception("Connect timeout expired")
+            if (!channel.isConnected) {
+                throw Exception("Connect timeout expired")
+            }
+        } catch (e: Throwable) {
+            // A failed connection attempt must not leak the channel and the selector (file descriptors)
+            close()
+            throw e
+        }
+    }
+
+    override fun close() {
+        try {
+            super.close()
+        } finally {
+            selector.close()
         }
     }
 

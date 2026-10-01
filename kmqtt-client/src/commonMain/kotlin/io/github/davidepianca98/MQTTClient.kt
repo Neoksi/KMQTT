@@ -134,6 +134,9 @@ public class MQTTClient(
 
     private val currentReceivedPacket = MQTTCurrentPacket(maximumPacketSize.toUInt(), mqttVersion)
     private val lastActiveTimestamp = atomic(currentTimeMillis())
+    // Keep alive: last packet received from the server and the PINGREQ awaiting an answer (0 if none)
+    private val lastReceivedTimestamp = atomic(currentTimeMillis())
+    private val pingSentTimestamp = atomic(0L)
 
     // Session
     private var packetIdentifier: UInt = 1u
@@ -420,6 +423,9 @@ public class MQTTClient(
         }
 
         if (data != null) {
+            // Any packet from the server proves the connection is alive (PINGRESP included)
+            lastReceivedTimestamp.getAndSet(currentTimeMillis())
+            pingSentTimestamp.getAndSet(0L)
             try {
                 if (debugLog) {
                     println("Received: " + data.toHexString())
@@ -461,21 +467,27 @@ public class MQTTClient(
             throw lastException!!
         }
 
+        // Sending (PINGREQ included) refreshes lastActive, so a timeout based on it never fires and a half-open
+        // connection is never detected: wait for an answer to the PINGREQ instead
         val actualKeepAlive = keepAlive.value
         if (actualKeepAlive != 0 && isConnackReceived) {
-            if (currentTime > lastActive + (actualKeepAlive * 1000)) {
-                // Timeout
-                close()
-                lastException = MQTTException(ReasonCode.KEEP_ALIVE_TIMEOUT)
-                throw lastException!!
-            } else if (currentTime > lastActive + (actualKeepAlive * 1000 * 0.9)) {
+            val keepAliveMs = actualKeepAlive * 1000L
+            val pingSent = pingSentTimestamp.value
+            if (pingSent != 0L) {
+                if (currentTime > pingSent + keepAliveMs / 2) {
+                    // No PINGRESP (nor any other packet) in half of the keep alive interval
+                    close()
+                    lastException = MQTTException(ReasonCode.KEEP_ALIVE_TIMEOUT)
+                    throw lastException!!
+                }
+            } else if (currentTime > lastActive + (keepAliveMs * 0.9) || currentTime > lastReceivedTimestamp.value + keepAliveMs) {
                 val pingreq = if (mqttVersion == MQTTVersion.MQTT3_1_1) {
                     MQTT4Pingreq()
                 } else {
                     MQTT5Pingreq()
                 }
                 send(pingreq.toByteArray())
-                // TODO if not receiving pingresp after a reasonable amount of time, close connection
+                pingSentTimestamp.getAndSet(currentTime)
             }
         }
     }
