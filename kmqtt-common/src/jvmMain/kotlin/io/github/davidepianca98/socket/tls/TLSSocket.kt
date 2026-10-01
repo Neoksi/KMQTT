@@ -24,8 +24,14 @@ public actual open class TLSSocket(
 ) : Socket(channel, key, sendBuffer1, receiveBuffer1) {
 
     init {
-        engine.beginHandshake()
-        runHandshake()
+        try {
+            engine.beginHandshake()
+            runHandshake()
+        } catch (e: Throwable) {
+            // The channel belongs to this socket from now on: a failed handshake start must not leak it
+            close()
+            throw e
+        }
     }
 
     private fun handleReceiveBufferUnderflow() {
