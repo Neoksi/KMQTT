@@ -97,3 +97,4 @@ fabric.properties
 build/
 
 local.properties
+.kotlin/
