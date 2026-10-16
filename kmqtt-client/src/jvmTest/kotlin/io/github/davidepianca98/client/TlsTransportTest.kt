@@ -370,6 +370,66 @@ class TlsTransportTest {
         assertEquals(-1, peer.inputStream.read())
     }
 
+    /**
+     * S06b-T05f: `FlushAndClose` у TLS — сначала все TLS-записи данных (4 МиБ, сервер долго не читает: запись
+     * частичная), затем close_notify последней записью. Ретранслятор с `SO_RCVBUF` 4 КиБ записывает поток клиента.
+     */
+    @Test
+    fun flushAndCloseWritesAllRecordsThenCloseNotifyLast() {
+        val server = tlsServer()
+        server.enabledProtocols = arrayOf("TLSv1.2")
+        val accepted = acceptAsync(server)
+        val relay = ServerSocket()
+        relay.receiveBufferSize = 4 * 1024
+        relay.bind(InetSocketAddress(InetAddress.getLoopbackAddress(), 0), 50)
+        toClose += relay
+        val fromClient = java.io.ByteArrayOutputStream()
+        val clientDone = CountDownLatch(1)
+        thread(isDaemon = true, name = "tls-test-relay") {
+            val down = relay.accept().also { toClose += it }
+            val up = Socket(InetAddress.getLoopbackAddress(), server.localPort).also { toClose += it }
+            thread(isDaemon = true) { runCatching { up.getInputStream().copyTo(down.getOutputStream()) } }
+            val buffer = ByteArray(4096)
+            try {
+                while (true) {
+                    val n = down.getInputStream().read(buffer)
+                    if (n < 0) break
+                    synchronized(fromClient) { fromClient.write(buffer, 0, n) }
+                    up.getOutputStream().write(buffer, 0, n)
+                }
+            } catch (_: Exception) {
+            }
+            clientDone.countDown()
+            runCatching { up.shutdownOutput() }
+        }
+        val driver = TestDriver()
+        val host = startedHost(driver, TLSClientSettings(serverCertificate = serverPem))
+        driver.send(host, HostAction.Connect("localhost", relay.localPort, 10_000))
+        assertEquals(TransportEvent.Connected, driver.awaitEvent(10_000))
+        val peer = assertIs<SSLSocket>(accepted.poll(10, TimeUnit.SECONDS))
+
+        val size = 4 * 1024 * 1024
+        val payload = ByteArray(size) { (it * 13 + 1).toByte() }
+        driver.commands.add(HostAction.Write(payload))
+        driver.commands.add(HostAction.FlushAndClose(15_000))
+        host.wakeup()
+        Thread.sleep(300)
+        assertFalse(clientDone.await(0, TimeUnit.MILLISECONDS), "клиент не закрыл, пока остаток не дописан")
+        assertContentEquals(payload, peer.inputStream.readExactly(size))
+        assertTrue(clientDone.await(10, TimeUnit.SECONDS), "клиент закрыл соединение после дописывания")
+        val stream = synchronized(fromClient) { fromClient.toByteArray() }
+        var offset = 0
+        var lastType = -1
+        while (offset + 5 <= stream.size) {
+            lastType = stream[offset].toInt() and 0xFF
+            val length = ((stream[offset + 3].toInt() and 0xFF) shl 8) or (stream[offset + 4].toInt() and 0xFF)
+            offset += 5 + length
+        }
+        assertEquals(stream.size, offset, "поток клиента — целые TLS-записи")
+        assertEquals(21, lastType, "последняя запись клиента — alert (close_notify)")
+        assertEquals(-1, peer.inputStream.read())
+    }
+
     @Test
     fun serverCloseNotifyGivesEofThenCloseWithoutReset() {
         val (driver, host, peer) = connected()

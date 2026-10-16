@@ -24,11 +24,14 @@ internal fun nextHostThreadName(): String = NioActorHost.THREAD_NAME_PREFIX + ho
  * 2. действия шага ([HostAction]) исполняются по порядку: `Connect` — новый транспорт из фабрики (прежний
  *    закрывается), неблокирующий connect с дедлайном; `Write` — запись без блокировки, остаток по `OP_WRITE`;
  *    `PauseRead` — снять/вернуть `OP_READ` текущего транспорта; `CloseTransport` — закрыть канал;
- * 3. `select` до ближайшего дедлайна (драйвера или подключения); [wakeup] прерывает его сразу (H4). Если действия
- *    сразу дали события — `selectNow` и следующий оборот без сна.
+ *    `FlushAndClose` — отдать текущий транспорт на дописывание (S06b-T05f): он больше не текущий, его события
+ *    отбрасываются, чтение включено, канал закрывается на обороте, где `pendingWriteBytes == 0`, или по сроку;
+ * 3. `select` до ближайшего дедлайна (драйвера, подключения или дописывания); [wakeup] прерывает его сразу (H4).
+ *    Если действия сразу дали события — `selectNow` и следующий оборот без сна.
  *
  * Резолв имени — на `Dispatchers.IO` (W6 §4.6), остальное — на потоке хоста. [close] прерывает и идущее
- * подключение (H5): поток выходит, закрывая транспорт и селектор; приостановка до выхода потока — не дольше таймаута.
+ * подключение (H5): текущий транспорт закрывается сразу, дописывающиеся — не дольше своих сроков, затем поток
+ * выходит, закрывая селектор; приостановка до выхода потока — не дольше таймаута.
  * Одноразовый: после [close] не перезапускается.
  *
  * `PauseRead` относится к текущему транспорту: новый транспорт (`Connect`) начинает с включённым чтением.
@@ -110,10 +113,12 @@ public class NioActorHost internal constructor(
     private fun loop(driver: HostDriver, sel: Selector, context: NioTransportContext, dnsScope: CoroutineScope) {
         var cause: Throwable? = null
         var transport: MqttTransport? = null
+        val flushing = ArrayList<Flushing>()
         try {
             var pending: MutableList<TransportEvent> = ArrayList()
             while (!stopRequested) {
                 val now = clock.nowMs()
+                serviceFlushing(flushing, now)
                 transport?.let {
                     it.poll(now)
                     pending.addAll(it.events())
@@ -136,26 +141,27 @@ public class NioActorHost internal constructor(
                             transport?.close()
                             transport = null
                         }
+                        is HostAction.FlushAndClose -> {
+                            transport?.let { startFlush(flushing, it, now + action.timeoutMs) }
+                            transport = null
+                        }
                     }
                 }
                 if (stopRequested) break
                 transport?.let { pending.addAll(it.events()) }
-                val deadline = minDeadline(step.nextDeadlineMs, transport?.nextDeadlineMs())
-                val selected = when {
-                    pending.isNotEmpty() -> sel.selectNow()
-                    deadline == null -> sel.select()
-                    else -> {
-                        val timeout = deadline - clock.nowMs()
-                        if (timeout <= 0) sel.selectNow() else sel.select(timeout)
-                    }
-                }
-                if (selected > 0) {
-                    val keys = sel.selectedKeys()
-                    for (key in keys) {
-                        (key.attachment() as? NioTransport)?.onSelected(key)
-                    }
-                    keys.clear()
-                }
+                val deadline = minDeadline(
+                    minDeadline(step.nextDeadlineMs, transport?.nextDeadlineMs()),
+                    flushDeadline(flushing)
+                )
+                select(sel, deadline, now = pending.isNotEmpty())
+            }
+            // Остановка: текущий транспорт — сразу (H5), отданные на дописывание — до опустевшей очереди или срока
+            transport?.close()
+            transport = null
+            while (flushing.isNotEmpty()) {
+                serviceFlushing(flushing, clock.nowMs())
+                if (flushing.isEmpty()) break
+                select(sel, flushDeadline(flushing), now = false)
             }
         } catch (t: Throwable) {
             cause = t
@@ -164,6 +170,13 @@ public class NioActorHost internal constructor(
                 transport?.close()
             } catch (_: Throwable) {
             }
+            for (f in flushing) {
+                try {
+                    f.transport.close()
+                } catch (_: Throwable) {
+                }
+            }
+            flushing.clear()
             try {
                 sel.close()
             } catch (_: Throwable) {
@@ -174,6 +187,61 @@ public class NioActorHost internal constructor(
                 driver.onStopped(cause)
             } catch (_: Throwable) {
             }
+        }
+    }
+
+    /** Транспорт, отданный на [HostAction.FlushAndClose]: не текущий, закрывается по пустой очереди или [deadlineMs]. */
+    @OptIn(MqttCoreApi::class)
+    private class Flushing(val transport: MqttTransport, val deadlineMs: Long)
+
+    /** Отдать транспорт на дописывание; пустая очередь — закрыть сразу. Чтение включается (входящее отбрасывается). */
+    @OptIn(MqttCoreApi::class)
+    private fun startFlush(flushing: MutableList<Flushing>, transport: MqttTransport, deadlineMs: Long) {
+        transport.closeOutput() // у TLS — close_notify в очередь за данными
+        transport.events() // события транспорта драйверу больше не доставляются
+        if (transport.pendingWriteBytes <= 0L) {
+            transport.close()
+            return
+        }
+        // Закрытие с непрочитанными входящими даёт RST (H1): пока дописываем — читаем и отбрасываем
+        transport.setReadInterest(true)
+        flushing += Flushing(transport, deadlineMs)
+    }
+
+    /** Продвинуть дописывание: события отбрасываются; очередь пуста, транспорт упал или срок истёк — закрыть. */
+    @OptIn(MqttCoreApi::class)
+    private fun serviceFlushing(flushing: MutableList<Flushing>, now: Long) {
+        if (flushing.isEmpty()) return
+        val iterator = flushing.iterator()
+        while (iterator.hasNext()) {
+            val f = iterator.next()
+            f.transport.poll(now)
+            f.transport.events() // в т. ч. Failed: транспорт уже закрыт, pendingWriteBytes = 0
+            if (f.transport.pendingWriteBytes <= 0L || now >= f.deadlineMs) {
+                f.transport.close()
+                iterator.remove()
+            }
+        }
+    }
+
+    private fun flushDeadline(flushing: List<Flushing>): Long? = flushing.minOfOrNull { it.deadlineMs }
+
+    /** `select` до [deadline] (`null` — без срока), [now] — без ожидания; готовые ключи — их транспортам. */
+    private fun select(sel: Selector, deadline: Long?, now: Boolean) {
+        val selected = when {
+            now -> sel.selectNow()
+            deadline == null -> sel.select()
+            else -> {
+                val timeout = deadline - clock.nowMs()
+                if (timeout <= 0) sel.selectNow() else sel.select(timeout)
+            }
+        }
+        if (selected > 0) {
+            val keys = sel.selectedKeys()
+            for (key in keys) {
+                (key.attachment() as? NioTransport)?.onSelected(key)
+            }
+            keys.clear()
         }
     }
 

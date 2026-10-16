@@ -55,6 +55,13 @@ internal class FakeBroker(val version: MQTTVersion = MQTTVersion.MQTT5) {
     /** Делить входящее клиенту на куски по [chunk] байт (частичные чтения); `null` — целиком. */
     var chunk: Int? = null
 
+    /**
+     * Пропускная способность записи клиента для новых транспортов, байт за виртуальную мс (S06b-T05f): `null` —
+     * без ограничения (запись уходит сразу), `0` — брокер не читает (остаток висит). Байты попадают к брокеру
+     * (разбор, [log]) только когда «прочитаны»; у текущего транспорта меняется через [FakeTransport.drainPerMs].
+     */
+    var drainPerMs: Int? = null
+
     /** Пакеты клиента по порядку (все подключения). */
     val received = ArrayList<MQTTPacket>()
 
@@ -140,24 +147,64 @@ internal class FakeTransport(private val broker: FakeBroker, private val wakeup:
         }
     }
 
+    /** Пропускная способность записи (см. [FakeBroker.drainPerMs]); менять можно в любой момент. */
+    var drainPerMs: Int? = broker.drainPerMs
+
+    private val outQueue = ArrayDeque<ByteArray>()
+    private var outOffset = 0
+    private var outPending = 0L
+    private var lastDrainMs: Long? = null
+
     override fun write(bytes: ByteArray): Int {
-        if (closed) return 0
-        for (packet in parser.addData(bytes.asUByteArray())) broker.onPacket(this, packet)
-        return bytes.size
+        if (closed || bytes.isEmpty()) return 0
+        outQueue.addLast(bytes)
+        outPending += bytes.size
+        val before = outPending
+        if (drainPerMs == null) deliver(Long.MAX_VALUE)
+        return (before - outPending).toInt()
     }
 
-    override val pendingWriteBytes: Long get() = 0
+    override val pendingWriteBytes: Long get() = outPending
 
     override fun setReadInterest(enabled: Boolean) {
         readEnabled = enabled
     }
 
     override fun poll(nowMs: Long) {
+        val rate = drainPerMs
+        val last = lastDrainMs
+        lastDrainMs = nowMs
+        when {
+            rate == null -> deliver(Long.MAX_VALUE)
+            last != null && nowMs > last && outPending > 0 -> deliver((nowMs - last) * rate)
+        }
         val deadline = connectDeadline ?: return
         if (nowMs >= deadline) fail(MqttError.ConnectTimeout)
     }
 
-    override fun nextDeadlineMs(): Long? = connectDeadline
+    /** Ближайший срок: подключение или следующая порция «чтения» брокером (каждую мс, пока есть остаток). */
+    override fun nextDeadlineMs(): Long? {
+        val drain = if (outPending > 0 && (drainPerMs ?: 0) > 0) (lastDrainMs ?: 0L) + 1 else null
+        return listOfNotNull(connectDeadline, drain).minOrNull()
+    }
+
+    /** Отдать брокеру до [budget] байт из очереди записи (по порядку, с разбором пакетов). */
+    private fun deliver(budget: Long) {
+        var left = budget
+        while (left > 0 && outQueue.isNotEmpty() && !closed) {
+            val head = outQueue.first()
+            val n = minOf((head.size - outOffset).toLong(), left).toInt()
+            val part = head.copyOfRange(outOffset, outOffset + n)
+            outOffset += n
+            outPending -= n
+            left -= n
+            if (outOffset == head.size) {
+                outQueue.removeFirst()
+                outOffset = 0
+            }
+            for (packet in parser.addData(part.asUByteArray())) broker.onPacket(this, packet)
+        }
+    }
 
     override fun events(): List<TransportEvent> {
         while (readEnabled && inbound.isNotEmpty()) ready += inbound.removeFirst()
@@ -172,6 +219,9 @@ internal class FakeTransport(private val broker: FakeBroker, private val wakeup:
         broker.log += "close"
         inbound.clear()
         ready.clear()
+        outQueue.clear()
+        outOffset = 0
+        outPending = 0
     }
 
     fun inject(bytes: ByteArray) {
@@ -202,6 +252,9 @@ internal class FakeTransport(private val broker: FakeBroker, private val wakeup:
         // Как у NioTransport: пути ошибок закрывают канал сразу, событие — последнее
         connectDeadline = null
         inbound.clear()
+        outQueue.clear()
+        outOffset = 0
+        outPending = 0
         ready += TransportEvent.Failed(error)
         closed = true
         broker.log += "failed"

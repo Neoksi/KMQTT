@@ -1,5 +1,6 @@
 package io.github.davidepianca98.client
 
+import io.github.davidepianca98.client.internal.MqttClientImpl
 import io.github.davidepianca98.mqtt.packets.Qos
 import io.github.davidepianca98.mqtt.packets.mqtt.MQTTDisconnect
 import io.github.davidepianca98.mqtt.packets.mqtt.MQTTPublish
@@ -30,6 +31,7 @@ import kotlin.test.assertIs
 import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 /**
@@ -432,21 +434,132 @@ class MqttClientVirtualTest {
     }
 
     @Test
-    fun protocolErrorHoldsCloseTransportForDrainTimeWithoutEof() = runTest {
+    fun protocolErrorClosesTransportRightAfterDisconnectIsWrittenWithoutEof() = runTest {
+        // S06b-T05f: придержания 500 мс больше нет — остаток пуст, FlushAndClose закрывает сразу
         val rig = rig(broker = FakeBroker().apply { eofOnDisconnect = false })
         rig.connected()
         val start = currentTime
         rig.broker.send(byteArrayOf(0x00, 0x00))
         runCurrent()
         assertEquals(1, rig.broker.packets<MQTTDisconnect>().size)
+        assertTrue(rig.broker.current.closed)
+        assertEquals(start, currentTime)
+        assertEquals(listOf("connect", "CONNECT", "DISCONNECT", "close"), rig.broker.log)
+        assertEquals(HostAction.FlushAndClose(MqttClientImpl.CLOSE_FLUSH_MS), rig.host.actions.last())
+        rig.client.close()
+    }
+
+    @Test
+    fun protocolErrorDisconnectTailIsFlushedUnderSlowWritesBeforeClose() = runTest {
+        val rig = rig(broker = FakeBroker().apply { eofOnDisconnect = false })
+        rig.connected()
         val transport = rig.broker.current
-        advanceTimeBy(499)
+        transport.drainPerMs = 1 // DISCONNECT(code) уходит по байту в мс
+        val start = currentTime
+        rig.broker.send(byteArrayOf(0x00, 0x00))
         runCurrent()
-        assertFalse(transport.closed, "CloseTransport придержан ради остатка DISCONNECT")
-        advanceTimeBy(1)
+        assertTrue(transport.pendingWriteBytes > 0, "остаток DISCONNECT ещё в очереди")
+        assertFalse(transport.closed, "закрытие ждёт остаток")
+        assertIs<ConnectionState.Closed>(rig.client.connection.value)
+        advanceTimeBy(10) // DISCONNECT(code) MQTT 5 — несколько байт
         runCurrent()
+        assertTrue(transport.closed, "закрыт сразу после дописывания, задолго до срока")
+        val disconnect = assertIs<MQTT5Disconnect>(rig.broker.packets<MQTTDisconnect>().single())
+        assertEquals(ReasonCode.MALFORMED_PACKET, disconnect.reasonCode)
+        assertEquals(listOf("connect", "CONNECT", "DISCONNECT", "close"), rig.broker.log)
+        assertEquals(start + 10, currentTime)
+        rig.client.close()
+    }
+
+    // ---- закрытие: дописывание остатка (S06b-T05f) ----
+
+    @Test
+    fun closeWithZeroLingerAndEmptyBufferIsFasterThan100ms() = runTest {
+        val rig = rig(options(closeLinger = Duration.ZERO), FakeBroker().apply { eofOnDisconnect = false })
+        rig.connected()
+        val start = currentTime
+        rig.client.close()
+        assertTrue(currentTime - start < 100, "close() занял ${currentTime - start} мс виртуального времени")
+        assertEquals(listOf("connect", "CONNECT", "DISCONNECT", "close"), rig.broker.log)
+        assertEquals(ConnectionState.Closed(null), rig.client.connection.value)
+        assertFalse(rig.host.isRunning)
+    }
+
+    @Test
+    fun zeroLingerCloseFlushesPublishAndDisconnectUnderSlowWritesBeforeClosing() = runTest {
+        // H2 + дописывание: публикация и close() подряд, брокер читает 64 Б/мс — PUBLISH и DISCONNECT целиком до close
+        val rig = rig(options(closeLinger = Duration.ZERO), FakeBroker().apply { eofOnDisconnect = false })
+        val epoch = rig.connected().epoch
+        val transport = rig.broker.current
+        transport.drainPerMs = 64
+        val payload = ByteArray(32 * 1024) { it.toByte() }
+        val start = currentTime
+        val publish = async(start = CoroutineStart.UNDISPATCHED) { rig.client.publish("big", payload, qos = Qos.AT_MOST_ONCE) }
+        rig.client.close()
+        assertEquals(PublishResult.Sent(epoch), publish.await())
+        assertEquals(listOf("connect", "CONNECT", "PUBLISH", "DISCONNECT", "close"), rig.broker.log)
+        assertContentEquals(payload, rig.broker.packets<MQTTPublish>().single().payload!!.toByteArray())
+        val elapsed = currentTime - start
+        assertTrue(elapsed in 500..MqttClientImpl.CLOSE_FLUSH_MS, "дописывание ≈ 512 мс, факт $elapsed")
         assertTrue(transport.closed)
-        assertEquals(start + 500, currentTime)
+        assertFalse(rig.host.isRunning)
+    }
+
+    @Test
+    fun flushDeadlineClosesWithoutHangingWhenBrokerNeverReads() = runTest {
+        val rig = rig(options(closeLinger = Duration.ZERO), FakeBroker().apply { eofOnDisconnect = false })
+        rig.connected()
+        val transport = rig.broker.current
+        transport.drainPerMs = 0
+        val start = currentTime
+        rig.client.close()
+        assertEquals(start + MqttClientImpl.CLOSE_FLUSH_MS, currentTime, "закрытие по сроку дописывания")
+        assertTrue(transport.closed)
+        assertEquals(listOf("connect", "CONNECT", "close"), rig.broker.log, "DISCONNECT не дошёл — остаток отброшен по сроку")
+        assertEquals(ConnectionState.Closed(null), rig.client.connection.value)
+        assertFalse(rig.host.isRunning)
+    }
+
+    @Test
+    fun lingerCloseUnderSlowWritesEndsOnBrokerEofAfterWholeDisconnect() = runTest {
+        // H1: linger 3 с, брокер закрывает соединение, только получив DISCONNECT целиком (EOF по разбору)
+        val rig = rig(options(closeLinger = 3.seconds))
+        val epoch = rig.connected().epoch
+        val transport = rig.broker.current
+        transport.drainPerMs = 16
+        val start = currentTime
+        val publish = async(start = CoroutineStart.UNDISPATCHED) {
+            rig.client.publish("retained/clear", ByteArray(8 * 1024), retain = true, qos = Qos.AT_MOST_ONCE)
+        }
+        rig.client.close()
+        assertEquals(PublishResult.Sent(epoch), publish.await())
+        assertEquals(listOf("connect", "CONNECT", "PUBLISH", "DISCONNECT", "close"), rig.broker.log)
+        val elapsed = currentTime - start
+        assertTrue(elapsed in 500..1_000, "закрытие по EOF после дописывания ≈ 513 мс, факт $elapsed")
+        assertEquals(ConnectionState.Closed(null), rig.client.connection.value)
+    }
+
+    @Test
+    fun reconnectDoesNotCutTheFlushOfThePreviousTransport() = runTest {
+        // Ошибка протокола → DISCONNECT(code) дописывается на старом транспорте, пока движок переподключается
+        val rig = rig(options(reconnect = ReconnectPolicy(initial = 10.milliseconds, jitter = 0.0)), FakeBroker().apply { eofOnDisconnect = false })
+        rig.connected()
+        val first = rig.broker.current
+        first.drainPerMs = 0
+        rig.broker.send(byteArrayOf(0x00, 0x00))
+        runCurrent()
+        advanceTimeBy(50)
+        runCurrent()
+        assertEquals(2, rig.broker.transports.size, "переподключение идёт")
+        assertFalse(first.closed, "старый транспорт ещё дописывает")
+        first.drainPerMs = 1_000
+        rig.host.wakeup()
+        advanceTimeBy(5)
+        runCurrent()
+        assertTrue(first.closed)
+        assertEquals(ReasonCode.MALFORMED_PACKET, assertIs<MQTT5Disconnect>(rig.broker.packets<MQTTDisconnect>().first()).reasonCode)
+        val closeIndex = rig.broker.log.indexOf("close")
+        assertTrue(rig.broker.log.indexOf("DISCONNECT") in 0 until closeIndex, rig.broker.log.toString())
         rig.client.close()
     }
 

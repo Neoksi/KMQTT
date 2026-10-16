@@ -46,11 +46,11 @@ private val temporaryCounter = atomic(0L)
  * [ClientRequest] в очередь и будят хост (H4); всё остальное — на потоке хоста в [runOnce]: запросы → движок,
  * события транспорта → движок, тик → движок, действия движка → `HostAction` / входящие / состояние / исходы.
  *
- * Дописывание DISCONNECT (находка T03a): `HostAction.CloseTransport` отбрасывает недописанный остаток, а движок выдаёт
- * `Write(DISCONNECT)` и сразу `CloseTransport` (DISCONNECT(code) после ошибки протокола, `closeLinger = 0`). Остаток
- * записи драйверу не виден (контракт хоста T04a), поэтому `CloseTransport`, выданный в одном шаге после `Write`,
- * придерживается до EOF/ошибки транспорта или [DRAIN_MS] (чтение на это время включается): брокер, получив
- * DISCONNECT, сам закрывает соединение.
+ * Дописывание DISCONNECT (находка T03a, S06b-T05f): `HostAction.CloseTransport` отбрасывает недописанный остаток, а
+ * движок выдаёт `Write(DISCONNECT)` и сразу `CloseTransport` (DISCONNECT(code) после ошибки протокола,
+ * `closeLinger = 0`). Поэтому `EngineAction.CloseTransport` после записи в том же шаге или при штатном закрытии
+ * (`close()`) переводится в `HostAction.FlushAndClose(`[CLOSE_FLUSH_MS]`)`: хост закрывает канал, когда остаток
+ * записи ушёл в ОС, или по сроку. Пути ошибок без записи (обрыв, ping-таймаут, зависший потребитель) закрывают сразу.
  *
  * Безопасность (решение владельца 2026-10-16, S06b-T05b): при `config.tls != null` клиент создаётся только с хостом,
  * который сам применяет TLS ([hostAppliesTls] — его ставит jvm-фабрика `MqttClient(options)`); иначе — отказ
@@ -89,8 +89,6 @@ internal class MqttClientImpl(
     private var pauseRequested = false
     private var closeRequested = false
     private var closeArmed = false
-    private var draining = false
-    private var drainDeadline = 0L
     private var wroteThisStep = false
     private var rejectedGroup: String? = null
     private var now = 0L
@@ -155,9 +153,10 @@ internal class MqttClientImpl(
             }
             RUNNING -> {
                 host.wakeup()
-                val limit = config.closeLinger.inWholeMilliseconds + DRAIN_MS + CLOSE_MARGIN_MS
+                val limit = config.closeLinger.inWholeMilliseconds + CLOSE_FLUSH_MS + CLOSE_MARGIN_MS
                 withTimeoutOrNull(limit) { drained.await() }
-                host.close(HOST_CLOSE_TIMEOUT_MS)
+                // Хост доводит дописывание (FlushAndClose) не дольше CLOSE_FLUSH_MS, затем останавливается
+                host.close(CLOSE_FLUSH_MS + HOST_CLOSE_TIMEOUT_MS)
                 finish(null)
             }
             else -> closedSignal.await()
@@ -198,22 +197,13 @@ internal class MqttClientImpl(
         drainOverflow(out)
         while (true) handle(requests.tryReceive().getOrNull() ?: break, out)
         for (event in events) {
-            if (draining && (event == TransportEvent.Eof || event is TransportEvent.Failed)) {
-                draining = false
-                if (event == TransportEvent.Eof) out += HostAction.CloseTransport
-            }
             engine.onTransport(event, nowMs)
             process(out)
         }
         engine.onTick(nowMs)
         process(out)
-        if (draining && nowMs >= drainDeadline) {
-            draining = false
-            out += HostAction.CloseTransport
-        }
         var deadline = engine.nextDeadline()
-        if (draining) deadline = deadline?.coerceAtMost(drainDeadline) ?: drainDeadline
-        if (closeRequested && !draining && engine.state is ConnectionState.Closed) {
+        if (closeRequested && engine.state is ConnectionState.Closed) {
             closeArmed = true
             deadline = nowMs
         }
@@ -276,7 +266,6 @@ internal class MqttClientImpl(
     private fun apply(action: EngineAction, out: MutableList<HostAction>) {
         when (action) {
             is EngineAction.Connect -> {
-                draining = false // хост закроет прежний транспорт сам
                 wroteThisStep = false
                 out += HostAction.Connect(action.host, action.port, action.timeoutMs)
             }
@@ -285,12 +274,12 @@ internal class MqttClientImpl(
                 out += HostAction.Write(action.bytes)
             }
             EngineAction.CloseTransport -> {
-                if (wroteThisStep) {
-                    draining = true
-                    drainDeadline = now + DRAIN_MS
-                    out += HostAction.PauseRead(false)
+                // После записи (DISCONNECT, DISCONNECT(code)) или при штатном закрытии — дописать, затем закрыть;
+                // хост закроет сразу, если очередь записи пуста
+                out += if (wroteThisStep || closeRequested) {
+                    HostAction.FlushAndClose(CLOSE_FLUSH_MS)
                 } else {
-                    out += HostAction.CloseTransport
+                    HostAction.CloseTransport
                 }
                 wroteThisStep = false
             }
@@ -399,8 +388,12 @@ internal class MqttClientImpl(
         private const val CLOSING = 2
         private const val CLOSED = 3
 
-        /** Сколько придерживать `CloseTransport` после `Write` в том же шаге (меньше минимальной задержки реконнекта). */
-        const val DRAIN_MS: Long = 500
+        /**
+         * Предельный срок дописывания остатка записи перед закрытием (`HostAction.FlushAndClose`). Константа, а не
+         * `closeLinger`: при `closeLinger = 0` DISCONNECT тоже должен дойти, а большой `closeLinger` не должен
+         * растягивать остановку хоста. Пустая очередь закрывается сразу — срок тратится только на настоящий остаток.
+         */
+        const val CLOSE_FLUSH_MS: Long = 1_000
 
         /** Запас к `closeLinger` на штатное закрытие, прежде чем остановить хост принудительно. */
         const val CLOSE_MARGIN_MS: Long = 2_000

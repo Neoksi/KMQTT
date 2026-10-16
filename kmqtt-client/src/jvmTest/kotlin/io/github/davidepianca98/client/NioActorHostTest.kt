@@ -17,6 +17,7 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.LinkedBlockingQueue
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicLong
+import java.util.concurrent.atomic.AtomicReference
 import kotlin.concurrent.thread
 import kotlin.test.AfterTest
 import kotlin.test.Test
@@ -375,6 +376,110 @@ class NioActorHostTest {
             if (pendingRef.get() == 0L) break
         }
         assertEquals(0L, pendingRef.get(), "очередь записи опустела")
+    }
+
+    /**
+     * S06b-T05f: `Write(8 МиБ)` + `Write(DISCONNECT)` + `FlushAndClose` при `SO_RCVBUF` 4 КиБ — запись частичная;
+     * `host.close()` во время дописывания ждёт его; сервер получает всё, включая хвост, затем FIN (не RST). События
+     * отданного на дописывание транспорта драйверу не доставляются.
+     */
+    @Test
+    fun flushAndCloseDeliversWholeTailThenFinAndHostCloseWaitsForIt() {
+        val server = server(receiveBuffer = 4 * 1024)
+        var transport: NioTransport? = null
+        val factory = NioTransportFactory { ctx -> NioTransport(ctx).also { transport = it } }
+        val driver = TestDriver()
+        val pendingRef = AtomicLong(-1L)
+        driver.onRun = { pendingRef.set(transport?.pendingWriteBytes ?: -1L) }
+        val host = startedHost(driver, factory)
+        driver.send(host, HostAction.Connect("127.0.0.1", server.localPort, 5_000))
+        val peer = server.accept().also { toClose += it }
+        assertEquals(TransportEvent.Connected, driver.awaitEvent())
+
+        val size = 8 * 1024 * 1024
+        val payload = ByteArray(size) { (it * 31 + 7).toByte() }
+        val disconnect = byteArrayOf(0xE0.toByte(), 0x00)
+        driver.commands.add(HostAction.Write(payload))
+        driver.commands.add(HostAction.Write(disconnect))
+        driver.commands.add(HostAction.FlushAndClose(10_000))
+        host.wakeup()
+        Thread.sleep(300)
+        driver.runs.clear()
+        host.wakeup()
+        assertNotNull(driver.runs.poll(1, TimeUnit.SECONDS), "поток хоста не заблокирован дописыванием")
+        assertTrue(pendingRef.get() > 0, "запись частичная (остаток ${pendingRef.get()})")
+        peer.getOutputStream().write("late".encodeToByteArray()) // входящее во время дописывания
+        peer.getOutputStream().flush()
+
+        val closeResult = AtomicReference<Boolean?>(null)
+        val closer = thread(isDaemon = true) { closeResult.set(runBlocking { host.close(15_000) }) }
+        Thread.sleep(200)
+        assertNull(closeResult.get(), "host.close() ждёт дописывания")
+
+        peer.soTimeout = 10_000
+        val input = peer.getInputStream()
+        assertContentEquals(payload + disconnect, input.readExactly(size + disconnect.size))
+        assertEquals(-1, input.read(), "FIN после всего остатка (без Connection reset)")
+        closer.join(5_000)
+        assertEquals(true, closeResult.get(), "хост остановлен после дописывания")
+        assertTrue(driver.events.none { it is TransportEvent.Bytes || it == TransportEvent.Eof }, "события после FlushAndClose не доставляются")
+    }
+
+    @Test
+    fun flushAndCloseDeadlineClosesWithoutBlockingHostWhenPeerNeverReads() {
+        val server = server(receiveBuffer = 4 * 1024)
+        var transport: NioTransport? = null
+        val factory = NioTransportFactory { ctx -> NioTransport(ctx).also { transport = it } }
+        val driver = TestDriver()
+        val pendingRef = AtomicLong(-1L)
+        driver.onRun = { pendingRef.set(transport?.pendingWriteBytes ?: -1L) }
+        val host = startedHost(driver, factory)
+        driver.send(host, HostAction.Connect("127.0.0.1", server.localPort, 5_000))
+        server.accept().also { toClose += it } // сервер не читает
+        assertEquals(TransportEvent.Connected, driver.awaitEvent())
+
+        driver.commands.add(HostAction.Write(ByteArray(8 * 1024 * 1024)))
+        val t0 = System.nanoTime()
+        driver.commands.add(HostAction.FlushAndClose(300))
+        host.wakeup()
+        Thread.sleep(100)
+        driver.runs.clear()
+        host.wakeup()
+        assertNotNull(driver.runs.poll(1, TimeUnit.SECONDS))
+        assertTrue(pendingRef.get() > 0, "остаток висит")
+        // Поток хоста отвечает, а по сроку транспорт закрыт (очередь сброшена) — без ожидания читателя
+        val deadline = System.currentTimeMillis() + 5_000
+        while (pendingRef.get() != 0L && System.currentTimeMillis() < deadline) {
+            driver.runs.clear()
+            host.wakeup()
+            assertNotNull(driver.runs.poll(1, TimeUnit.SECONDS), "runOnce во время дописывания")
+            Thread.sleep(10)
+        }
+        val elapsedMs = (System.nanoTime() - t0) / 1_000_000
+        assertEquals(0L, pendingRef.get(), "транспорт закрыт по сроку")
+        assertTrue(elapsedMs in 250..3_000, "закрытие по сроку через $elapsedMs мс")
+        val started = System.nanoTime()
+        assertTrue(runBlocking { host.close(5_000) })
+        assertTrue((System.nanoTime() - started) / 1_000_000 < 1_000, "close() без дописывающихся — сразу")
+    }
+
+    @Test
+    fun flushAndCloseWithEmptyQueueClosesAtOnce() {
+        val server = server()
+        val driver = TestDriver()
+        val host = startedHost(driver)
+        driver.send(host, HostAction.Connect("127.0.0.1", server.localPort, 5_000))
+        val peer = server.accept().also { toClose += it }
+        assertEquals(TransportEvent.Connected, driver.awaitEvent())
+        driver.send(host, HostAction.Write("hi".encodeToByteArray()))
+        peer.soTimeout = 2_000
+        val input = peer.getInputStream()
+        assertContentEquals("hi".encodeToByteArray(), input.readExactly(2))
+        val t0 = System.nanoTime()
+        driver.send(host, HostAction.FlushAndClose(10_000))
+        assertEquals(-1, input.read(), "FIN сразу")
+        assertTrue((System.nanoTime() - t0) / 1_000_000 < 1_000)
+        assertTrue(runBlocking { host.close(1_000) })
     }
 
     @Test

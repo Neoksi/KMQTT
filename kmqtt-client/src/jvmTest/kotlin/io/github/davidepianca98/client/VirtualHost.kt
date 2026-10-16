@@ -49,11 +49,59 @@ internal class VirtualHost(private val scope: TestScope, val broker: FakeBroker 
         if (started && !closed) wake.trySend(Unit)
     }
 
+    /** Пробуждение от транспортов (в т. ч. дописывающихся после [close]). */
+    private fun poke() {
+        if (started) wake.trySend(Unit)
+    }
+
+    /** Как у `NioActorHost`: `runOnce` больше не вызывается, текущий транспорт закрывается, дописывание доводится. */
     override suspend fun close(timeoutMs: Long): Boolean {
         if (closed) return true
         closed = true
-        job?.cancelAndJoin()
-        return true
+        val running = job ?: return true
+        wake.trySend(Unit)
+        val stopped = withTimeoutOrNull(timeoutMs) { running.join() } != null
+        if (!stopped) running.cancelAndJoin()
+        return stopped
+    }
+
+    /** Транспорты на дописывании ([HostAction.FlushAndClose]) с их сроками. */
+    private val flushing = ArrayList<Pair<FakeTransport, Long>>()
+
+    private fun startFlush(transport: FakeTransport, deadlineMs: Long) {
+        transport.closeOutput()
+        transport.events()
+        if (transport.pendingWriteBytes <= 0L) {
+            transport.close()
+            return
+        }
+        transport.setReadInterest(true)
+        flushing += transport to deadlineMs
+    }
+
+    private fun serviceFlushing(now: Long) {
+        val iterator = flushing.iterator()
+        while (iterator.hasNext()) {
+            val (t, deadline) = iterator.next()
+            t.poll(now)
+            t.events()
+            if (t.pendingWriteBytes <= 0L || now >= deadline) {
+                t.close()
+                iterator.remove()
+            }
+        }
+    }
+
+    private fun flushDeadline(): Long? =
+        flushing.flatMap { (t, deadline) -> listOfNotNull(deadline, t.nextDeadlineMs()) }.minOrNull()
+
+    private suspend fun waitUntil(deadline: Long?) {
+        if (deadline == null) {
+            wake.receive()
+        } else {
+            val wait = deadline - nowMs()
+            if (wait > 0) withTimeoutOrNull(wait) { wake.receive() } else wake.tryReceive()
+        }
     }
 
     private suspend fun loop(driver: HostDriver) {
@@ -61,8 +109,9 @@ internal class VirtualHost(private val scope: TestScope, val broker: FakeBroker 
         var cause: Throwable? = null
         try {
             var pending = ArrayList<TransportEvent>()
-            while (true) {
+            while (!closed) {
                 val now = nowMs()
+                serviceFlushing(now)
                 transport?.let {
                     it.poll(now)
                     pending.addAll(it.events())
@@ -72,11 +121,12 @@ internal class VirtualHost(private val scope: TestScope, val broker: FakeBroker 
                 val step = driver.runOnce(now, events)
                 steps++
                 for (action in step.actions) {
+                    if (closed) break
                     actions += action
                     when (action) {
                         is HostAction.Connect -> {
                             transport?.close()
-                            val created = FakeTransport(broker, ::wakeup)
+                            val created = FakeTransport(broker, ::poke)
                             broker.transports += created
                             transport = created
                             created.connect(action.host, action.port, now + action.timeoutMs)
@@ -87,18 +137,24 @@ internal class VirtualHost(private val scope: TestScope, val broker: FakeBroker 
                             transport?.close()
                             transport = null
                         }
+                        is HostAction.FlushAndClose -> {
+                            transport?.let { startFlush(it, now + action.timeoutMs) }
+                            transport = null
+                        }
                     }
                 }
+                if (closed) break
                 transport?.let { pending.addAll(it.events()) }
                 yield()
                 if (pending.isNotEmpty()) continue
-                val deadline = listOfNotNull(step.nextDeadlineMs, transport?.nextDeadlineMs()).minOrNull()
-                if (deadline == null) {
-                    wake.receive()
-                } else {
-                    val wait = deadline - nowMs()
-                    if (wait > 0) withTimeoutOrNull(wait) { wake.receive() } else wake.tryReceive()
-                }
+                waitUntil(listOfNotNull(step.nextDeadlineMs, transport?.nextDeadlineMs(), flushDeadline()).minOrNull())
+            }
+            transport?.close()
+            transport = null
+            while (true) {
+                serviceFlushing(nowMs())
+                if (flushing.isEmpty()) break
+                waitUntil(flushDeadline())
             }
         } catch (e: CancellationException) {
             throw e
@@ -106,6 +162,8 @@ internal class VirtualHost(private val scope: TestScope, val broker: FakeBroker 
             cause = e
         } finally {
             transport?.close()
+            flushing.forEach { it.first.close() }
+            flushing.clear()
             if (!stoppedNotified) {
                 stoppedNotified = true
                 driver.onStopped(cause)

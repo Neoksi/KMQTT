@@ -57,6 +57,8 @@ public fun NioTransportFactory.Companion.tls(
  * - Удалённая сторона закрыла поток (close_notify или EOF TCP после рукопожатия) — [TransportEvent.Eof] после всех
  *   расшифрованных данных; EOF во время рукопожатия — ошибка `ssl`.
  * - [close]: после рукопожатия — `closeOutbound` и запись close_notify без ожидания ответа, затем закрытие сокета.
+ *   При `HostAction.FlushAndClose` хост сначала вызывает [closeOutput] (close_notify — в очередь за данными), затем
+ *   [close], когда [pendingWriteBytes] стал 0: close_notify ушёл в ОС последней записью.
  *
  * [pendingWriteBytes] — открытый текст, ждущий конца рукопожатия, плюс шифротекст в очереди внутреннего транспорта.
  */
@@ -160,6 +162,31 @@ public class TlsTransport(
         val out = ArrayList(events)
         events.clear()
         return out
+    }
+
+    /**
+     * Для `HostAction.FlushAndClose`: зашифровать оставшийся открытый текст, затем `closeOutbound` и close_notify —
+     * в очередь внутреннего транспорта за всеми TLS-записями данных. Хост закроет транспорт, когда очередь опустеет:
+     * close_notify уходит последней записью (при прямом [close] он теряется, если буфер отправки сокета полон).
+     * До конца рукопожатия — ничего (данных приложения ещё нет; [close] закроет сокет).
+     */
+    override fun closeOutput() {
+        if (phase != Phase.Open) return
+        pump()
+        val e = engine ?: return
+        if (phase != Phase.Open) return
+        try {
+            e.closeOutbound()
+            var guard = 0
+            while (!e.isOutboundDone && guard++ < 4) {
+                if (!wrapInto(e, EMPTY_ARRAY)) break
+            }
+        } catch (_: Exception) {
+            // close_notify — по возможности; данные уже в очереди
+        }
+        // После closeOutbound открытый текст не зашифровать: остаток (его быть не должно) не ждём
+        appOut.clear()
+        appOutBytes = 0
     }
 
     override fun close() {
