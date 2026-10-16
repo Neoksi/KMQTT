@@ -4,16 +4,16 @@ import io.github.davidepianca98.client.core.MqttCoreApi
 import kotlin.time.TimeSource
 
 /**
- * Часы клиента: монотонные миллисекунды. Все дедлайны хоста и движка ([HostStep.nextDeadlineMs],
- * [HostAction.Connect.timeoutMs]) считаются в шкале этих часов — от значения `nowMs`, которое хост передаёт в
- * [HostDriver.runOnce].
+ * Clock of the client: monotonic milliseconds. All deadlines of the host and the engine ([HostStep.nextDeadlineMs],
+ * [HostAction.Connect.timeoutMs]) are measured on the scale of this clock, starting from the value `nowMs` that the host
+ * passes to [HostDriver.runOnce].
  */
 public interface MqttClock {
-    /** Текущее монотонное время, мс. Начало отсчёта не задано: сравнивать можно только значения одних часов. */
+    /** Current monotonic time in milliseconds. The origin is unspecified: only values of the same clock are comparable. */
     public fun nowMs(): Long
 
     public companion object {
-        /** Монотонные часы процесса (`kotlin.time.TimeSource.Monotonic`, одна отметка на процесс). */
+        /** The process-wide monotonic clock (`kotlin.time.TimeSource.Monotonic`, one origin per process). */
         public val Monotonic: MqttClock get() = MonotonicClock
     }
 }
@@ -189,27 +189,29 @@ public interface HostDriver {
 }
 
 /**
- * Хост цикла клиента: поток (или иной исполнитель), который крутит [HostDriver] и исполняет ввод-вывод.
- * Одноразовый: [start] — один раз, после [close] не перезапускается. Реализация по умолчанию — `NioActorHost` (jvm).
+ * Host of the client loop: a thread (or another executor) that runs the [HostDriver] and performs the I/O. Single-use:
+ * [start] is called once and the host cannot be restarted after [close]. The default implementation is `NioActorHost`
+ * (JVM, plain TCP). Implementing a custom host is experimental: the driver and transport contracts are marked
+ * `@MqttCoreApi` and may change.
  */
 public interface MqttHost {
-    /** Запустить цикл с драйвером. Повторный вызов или вызов после [close] — `IllegalStateException`. */
+    /** Starts the loop with the driver. A second call, or a call after [close], throws [IllegalStateException]. */
     @MqttCoreApi
     public fun start(driver: HostDriver)
 
     /**
-     * Разбудить цикл: ближайший [HostDriver.runOnce] выполнится без ожидания дедлайна. Неблокирующий, из любого
-     * потока; пробуждение до `select` не теряется. До [start] и после [close] — ничего.
+     * Wakes the loop: the next [HostDriver.runOnce] runs without waiting for a deadline. Non-blocking, callable from any
+     * thread; a wake-up that arrives before the loop sleeps is not lost. Does nothing before [start] and after [close].
      */
     public fun wakeup()
 
     /**
-     * Остановить цикл: [HostDriver.runOnce] больше не вызывается, текущий транспорт закрывается сразу (идущее
-     * подключение прерывается), транспорты, отданные на [HostAction.FlushAndClose], дописываются не дольше своих
-     * сроков, затем поток завершается и селектор закрывается. Приостанавливается до выхода потока, но не дольше
-     * [timeoutMs]. Возвращает `true`, если хост остановлен полностью, `false` — истёк таймаут (поток ещё жив).
-     * Повторный вызов безвреден. Штатное закрытие MQTT-сессии (DISCONNECT, ожидание EOF) — дело драйвера до
-     * вызова [close].
+     * Stops the loop: [HostDriver.runOnce] is no longer called, the current transport is closed at once (a connection in
+     * progress is aborted), transports handed over with [HostAction.FlushAndClose] are flushed for no longer than their
+     * own deadlines, then the thread ends and the selector is closed. Suspends until the thread has exited but for at
+     * most [timeoutMs]. Returns `true` when the host stopped completely and `false` when the timeout elapsed (the thread
+     * is still alive). A repeated call is harmless. The orderly close of the MQTT session (DISCONNECT, waiting for EOF)
+     * is the driver's job and happens before [close].
      */
     public suspend fun close(timeoutMs: Long = 5_000): Boolean
 }

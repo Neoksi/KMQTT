@@ -4,15 +4,17 @@ import io.github.davidepianca98.client.core.MqttCoreApi
 import io.github.davidepianca98.client.internal.MqttClientImpl
 
 /**
- * Клиент на собственном потоке хоста `kmqtt-io-<n>` ([NioActorHost], часы [MqttClock.Monotonic]) — основная фабрика
- * на JVM (S06b-T05b).
+ * Creates an [MqttClient] that runs on its own I/O thread `kmqtt-io-<n>` ([NioActorHost], clock
+ * [MqttClock.Monotonic]). This is the main factory on the JVM and the only one that supports TLS.
  *
- * TLS (решение владельца 2026-10-16): при [MqttClientOptions.tls] `!= null` хост строится с TLS-транспортом
- * `NioTransportFactory.tls(tls, verifyHostname)` — проверка имени хоста и SNI включены, пока
- * [MqttClientOptions.verifyHostname] не выключен явно; без `tls` — обычный TCP. Открытым текстом при заданном `tls`
- * клиент не подключается никогда: общая фабрика `MqttClient(options, host, clock)` с `tls != null` отказывает.
+ * Without [MqttClientOptions.tls] the client uses plain TCP. With `tls != null` the host is built with a TLS transport
+ * and the host name (and SNI) verification is on unless [MqttClientOptions.verifyHostname] is turned off explicitly.
+ * The client never connects in plain text when `tls` is set: the common factory `MqttClient(options, host, clock)`
+ * throws for `tls != null`, because it cannot know that a given host applies TLS.
  *
- * Проверка параметров — `IllegalArgumentException` (текст без адресов и секретов).
+ * The thread is started by the first request, not by this call. Always call [MqttClient.close] when done.
+ *
+ * Invalid options throw [IllegalArgumentException]; the message contains no addresses or secrets.
  */
 @OptIn(MqttCoreApi::class)
 public fun MqttClient(options: MqttClientOptions): MqttClient {
