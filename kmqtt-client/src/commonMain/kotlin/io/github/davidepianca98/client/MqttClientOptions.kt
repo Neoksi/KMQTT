@@ -168,6 +168,12 @@ public data class OfflineQueue(val ttl: Duration = 10.seconds, val capacity: Int
  * @param maxTopicLength largest accepted topic of an incoming PUBLISH, in UTF-8 bytes; longer ones are dropped
  *   ([DropReason.TopicTooLong]).
  * @param incomingBuffer number of messages [MqttClient.incoming] buffers before the client stops reading the socket.
+ *   Memory bound of the incoming path: this buffer plus the messages decoded in the single I/O step that found it full
+ *   (they are held in order beyond the buffer; the next steps do not read the socket until the collector has made room).
+ *   One step reads at most one burst of the socket: 4 reads of 16 KiB = 64 KiB of wire bytes on the JVM host (with TLS,
+ *   the plaintext of that much ciphertext, plus at most one TLS record). A packet whose beginning was read in earlier
+ *   steps (up to [maxIncomingPacket]) may complete in that step too, and session markers are added as they occur. The
+ *   number of held messages therefore depends on their size: about 4 messages of 16 KiB, or several thousand tiny ones.
  * @param consumerStallLimit how long reading may stay paused because the buffer is full before the connection is closed
  *   with [MqttError.ConsumerStalled]. A reconnect starts only after the consumer has drained the buffer: until then
  *   the client stays in [ConnectionState.Waiting] without any network activity.

@@ -312,6 +312,11 @@ subs.resubscribe("sensors") // subscribe again so that the broker re-sends retai
 socket**, so the pressure travels through TCP to the broker and nothing is dropped. Keep-alive pings keep going while
 reading is paused, so the broker does not drop a healthy but slow client.
 
+Memory of the incoming path is bounded by the buffer plus one socket read burst: the messages decoded in the step that
+found the buffer full are held in order beyond it, and the client reads nothing more until the collector has made room.
+On the JVM host a burst is at most 4 × 16 KiB = 64 KiB of wire bytes (with TLS the plaintext of that, plus at most one
+TLS record); a packet started in earlier reads (up to `maxIncomingPacket`) may complete in the same step.
+
 If the collector takes nothing for longer than `MqttLimits.consumerStallLimit` (60 s) the client assumes the consumer is
 dead and closes the connection with `MqttError.ConsumerStalled`. After that the client stays in
 `Waiting(lastError = ConsumerStalled)` without any network activity until the consumer has drained the buffer, and only
