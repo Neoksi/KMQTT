@@ -82,7 +82,11 @@ internal class MqttClientImpl(
 
     private val engine = MqttClientEngine(config.toEngineOptions(), nextEpoch = { epochCounter.incrementAndGet() })
     private val requests = Channel<ClientRequest>(Channel.UNLIMITED)
-    private val incomingChannel = Channel<MqttIncoming>(config.limits.incomingBuffer)
+    private val gate = IncomingGate<MqttIncoming>(
+        capacity = config.limits.incomingBuffer,
+        wake = { host.wakeup() },
+        onPause = { engine.onCommand(EngineCommand.SetReadPaused(true), now) },
+    )
     private val stateFlow = MutableStateFlow<ConnectionState>(ConnectionState.Idle)
     private val closedSignal = CompletableDeferred<Unit>()
     private val drained = CompletableDeferred<Unit>()
@@ -91,15 +95,12 @@ internal class MqttClientImpl(
     private val lock = reentrantLock()
     private var lifecycle = NEW // под lock
     private val collected = atomic(false)
-    private val readPaused = atomic(false)
     private val tickets = atomic(0L)
     private val finalized = atomic(false)
 
     // ---- только поток хоста ----
     private val publishes = HashMap<PublishTicket, CompletableDeferred<PublishResult>>()
     private val connectWaiters = ArrayList<CompletableDeferred<ConnectResult>>()
-    private val overflow = ArrayDeque<MqttIncoming>()
-    private var pauseRequested = false
     private var closeRequested = false
     private var closeArmed = false
     private var wroteThisStep = false
@@ -115,10 +116,7 @@ internal class MqttClientImpl(
 
     override val incoming: Flow<MqttIncoming> = flow {
         check(collected.compareAndSet(false, true)) { "MqttClient.incoming: only one collector" }
-        for (item in incomingChannel) {
-            if (readPaused.value) host.wakeup()
-            emit(item)
-        }
+        gate.consume { emit(it) }
     }
 
     override fun start() {
@@ -211,7 +209,10 @@ internal class MqttClientImpl(
             return HostStep.Idle
         }
         val out = ArrayList<HostAction>()
-        drainOverflow(out)
+        if (gate.drain()) {
+            engine.onCommand(EngineCommand.SetReadPaused(false), now)
+            process(out)
+        }
         while (true) handle(requests.tryReceive().getOrNull() ?: break, out)
         for (event in events) {
             if (packetLog) observeIncoming(event)
@@ -307,7 +308,8 @@ internal class MqttClientImpl(
                 wroteThisStep = false
             }
             is EngineAction.PauseRead -> out += HostAction.PauseRead(action.paused)
-            is EngineAction.Emit -> deliver(action.incoming)
+            // Нет места в буфере — ворота удержат по порядку и приостановят чтение (W6 §4.5, [IncomingGate])
+            is EngineAction.Emit -> gate.offer(action.incoming)
             is EngineAction.State -> onState(action.state)
             is EngineAction.Complete -> publishes.remove(action.ticket)?.complete(action.result)
             is EngineAction.Log -> log(action.event)
@@ -317,30 +319,6 @@ internal class MqttClientImpl(
                 rejectedGroup = action.group
                 safeLog { groupRejected(action.filters, action.limit) }
             }
-        }
-    }
-
-    /** Входящее — в буфер; нет места — держать у себя по порядку и приостановить чтение (W6 §4.5). */
-    private fun deliver(item: MqttIncoming) {
-        if (overflow.isEmpty() && incomingChannel.trySend(item).isSuccess) return
-        overflow.addLast(item)
-        if (!pauseRequested) {
-            pauseRequested = true
-            readPaused.value = true
-            engine.onCommand(EngineCommand.SetReadPaused(true), now)
-            // D5 ревью G1 (SEVEN-255): потребитель мог опустошить канал между неудачным trySend и флагом и уснуть
-            // без пробуждения хоста. Флаг уже стоит: переложить ещё раз — всё, что он возьмёт дальше, разбудит хост
-            while (overflow.isNotEmpty() && incomingChannel.trySend(overflow.first()).isSuccess) overflow.removeFirst()
-        }
-    }
-
-    private fun drainOverflow(out: MutableList<HostAction>) {
-        while (overflow.isNotEmpty() && incomingChannel.trySend(overflow.first()).isSuccess) overflow.removeFirst()
-        if (overflow.isEmpty() && pauseRequested) {
-            pauseRequested = false
-            readPaused.value = false
-            engine.onCommand(EngineCommand.SetReadPaused(false), now)
-            process(out)
         }
     }
 
@@ -404,7 +382,7 @@ internal class MqttClientImpl(
         connectWaiters.clear()
         subs.failAll()
         if (error != null || stateFlow.value !is ConnectionState.Closed) stateFlow.value = ConnectionState.Closed(error)
-        incomingChannel.close()
+        gate.closeChannel()
         drained.complete(Unit)
         closedSignal.complete(Unit)
     }
