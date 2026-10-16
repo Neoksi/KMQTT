@@ -26,7 +26,11 @@ public actual open class Socket(
             try {
                 sendBuffer.put(byteArray)
             } catch (e: BufferOverflowException) {
-                sendBuffer = ByteBuffer.allocate(sendBuffer.capacity() + data.size)
+                // The buffer is in write mode: bytes accumulated but not yet written to the channel must survive the growth
+                val grown = ByteBuffer.allocate(sendBuffer.capacity() + byteArray.size)
+                sendBuffer.flip()
+                grown.put(sendBuffer)
+                sendBuffer = grown
                 sendBuffer.put(byteArray)
             }
             sendFromBuffer()

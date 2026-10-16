@@ -16,7 +16,7 @@ import javax.net.ssl.SSLException
 public actual open class TLSSocket(
     channel: SocketChannel,
     key: SelectionKey?,
-    private var sendBuffer1: ByteBuffer,
+    sendBuffer1: ByteBuffer,
     private var receiveBuffer1: ByteBuffer,
     private var sendAppBuffer: ByteBuffer,
     private var receiveAppBuffer: ByteBuffer,
@@ -51,14 +51,6 @@ public actual open class TLSSocket(
         receiveAppBuffer = newBuffer
     }
 
-    private fun handleSendBufferOverflow() {
-        sendBuffer1 = if (engine.session.packetBufferSize > sendBuffer1.capacity()) {
-            ByteBuffer.allocate(engine.session.applicationBufferSize)
-        } else {
-            ByteBuffer.allocate(sendBuffer1.capacity() * 2)
-        }
-    }
-
     private fun send0(data: UByteArray) {
         sendAppBuffer.clear()
         val dataByteArray = data.toByteArray()
@@ -70,24 +62,32 @@ public actual open class TLSSocket(
         }
         sendAppBuffer.flip()
         try {
+            var wrapCapacity = engine.session.packetBufferSize
+            // One wrap call produces one TLS record: repeat until all application data is wrapped. The records go
+            // through Socket.send, which owns the send buffer (it keeps the bytes the channel did not accept yet)
             do {
-                val result = engine.wrap(sendAppBuffer, sendBuffer1)
+                val wrapped = ByteBuffer.allocate(wrapCapacity)
+                val result = engine.wrap(sendAppBuffer, wrapped)
                 @Suppress("WHEN_ENUM_CAN_BE_NULL_IN_JAVA")
                 when (result.status) {
                     SSLEngineResult.Status.BUFFER_UNDERFLOW -> {
                         throw SSLException("Buffer Underflow in wrap")
                     }
                     SSLEngineResult.Status.BUFFER_OVERFLOW -> {
-                        handleSendBufferOverflow()
+                        wrapCapacity = maxOf(engine.session.packetBufferSize, wrapCapacity * 2)
                     }
                     SSLEngineResult.Status.OK -> {
-                        super.sendFromBuffer()
+                        if (sendAppBuffer.hasRemaining() && result.bytesConsumed() == 0 && result.bytesProduced() == 0) {
+                            throw SSLException("Wrap made no progress with unsent data")
+                        }
+                        wrapped.flip()
+                        super.send(wrapped.toUByteArray())
                     }
                     SSLEngineResult.Status.CLOSED -> {
                         throw SocketClosedException()
                     }
                 }
-            } while (result.status != SSLEngineResult.Status.OK)
+            } while (result.status != SSLEngineResult.Status.OK || sendAppBuffer.hasRemaining())
         } catch (e: SocketClosedException) {
             engine.closeOutbound()
             close()
