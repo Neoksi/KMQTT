@@ -18,8 +18,9 @@ import kotlin.time.Duration.Companion.seconds
  *
  * @param host адрес брокера (имя или IP); резолв — у хоста (на JVM — `Dispatchers.IO`).
  * @param credentials логин и пароль CONNECT; пустой логин приложение передаёт как `null`.
- * @param tls настройки TLS; `null` — обычный TCP. Применяет хост (JVM-перегрузка `MqttClient(options)`), фасад их
- *   только хранит.
+ * @param tls настройки TLS; `null` — обычный TCP. Применяет хост: на JVM — фабрика `MqttClient(options)`
+ *   (TLS-транспорт с [verifyHostname]); общая фабрика `MqttClient(options, host, clock)` при `tls != null` отказывает
+ *   (`IllegalArgumentException`) — открытым текстом клиент с `tls` не подключается никогда.
  * @param verifyHostname проверка имени хоста (и SNI) в сертификате брокера при TLS — **включена по умолчанию**, в том
  *   числе для закреплённого сертификата при подключении по IP (решение владельца 2026-10-16, W6 §8.2). Отключается
  *   только явно. Без [tls] не действует.
