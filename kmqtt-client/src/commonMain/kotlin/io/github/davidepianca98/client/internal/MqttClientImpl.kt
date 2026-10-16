@@ -16,17 +16,11 @@ import io.github.davidepianca98.client.MqttSubscriptionsImpl
 import io.github.davidepianca98.client.PublishFailure
 import io.github.davidepianca98.client.PublishResult
 import io.github.davidepianca98.client.PublishStage
-import io.github.davidepianca98.client.SubscribeRefused
-import io.github.davidepianca98.client.TopicState
 import io.github.davidepianca98.client.TransportEvent
 import io.github.davidepianca98.client.core.MqttCoreApi
-import io.github.davidepianca98.client.core.SessionCredentials
-import io.github.davidepianca98.client.core.SessionSettings
-import io.github.davidepianca98.client.core.WillSpec
 import io.github.davidepianca98.client.engine.EngineAction
 import io.github.davidepianca98.client.engine.EngineCommand
 import io.github.davidepianca98.client.engine.EngineLogEvent
-import io.github.davidepianca98.client.engine.EngineOptions
 import io.github.davidepianca98.client.engine.MqttClientEngine
 import io.github.davidepianca98.client.engine.PublishTicket
 import io.github.davidepianca98.mqtt.packets.Qos
@@ -44,23 +38,6 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlin.time.Duration
 
-/** Запрос API в очередь клиента; исполняется на потоке хоста строго по порядку (FIFO, H2). */
-@OptIn(MqttCoreApi::class)
-internal sealed interface ClientRequest {
-    class Command(val command: EngineCommand) : ClientRequest
-    class Publish(val command: EngineCommand.Publish, val result: CompletableDeferred<PublishResult>) : ClientRequest
-    class AwaitConnect(val result: CompletableDeferred<ConnectResult>) : ClientRequest
-    class AwaitApplied(val group: String, val result: CompletableDeferred<Map<String, TopicState>>) : ClientRequest
-    class TemporaryStart(
-        val group: String,
-        val filters: Set<String>,
-        val qos: Qos,
-        val refused: CompletableDeferred<SubscribeRefused>,
-    ) : ClientRequest
-    class TemporaryEnd(val group: String, val qos: Qos) : ClientRequest
-    object Close : ClientRequest
-}
-
 private val epochCounter = atomic(0L)
 private val temporaryCounter = atomic(0L)
 
@@ -74,13 +51,22 @@ private val temporaryCounter = atomic(0L)
  * записи драйверу не виден (контракт хоста T04a), поэтому `CloseTransport`, выданный в одном шаге после `Write`,
  * придерживается до EOF/ошибки транспорта или [DRAIN_MS] (чтение на это время включается): брокер, получив
  * DISCONNECT, сам закрывает соединение.
+ *
+ * Безопасность (решение владельца 2026-10-16, S06b-T05b): при `config.tls != null` клиент создаётся только с хостом,
+ * который сам применяет TLS ([hostAppliesTls] — его ставит jvm-фабрика `MqttClient(options)`); иначе — отказ
+ * `IllegalArgumentException` при создании, до запуска хоста: никогда не подключаться открытым текстом.
  */
 @OptIn(MqttCoreApi::class)
 internal class MqttClientImpl(
     override val config: MqttClientOptions,
     private val host: MqttHost,
     @Suppress("unused") private val clock: MqttClock,
+    hostAppliesTls: Boolean = false,
 ) : MqttClient, HostDriver {
+    init {
+        require(config.tls == null || hostAppliesTls) { TLS_HOST_REQUIRED }
+    }
+
     private val engine = MqttClientEngine(config.toEngineOptions(), nextEpoch = { epochCounter.incrementAndGet() })
     private val requests = Channel<ClientRequest>(Channel.UNLIMITED)
     private val incomingChannel = Channel<MqttIncoming>(config.limits.incomingBuffer)
@@ -420,32 +406,13 @@ internal class MqttClientImpl(
         const val CLOSE_MARGIN_MS: Long = 2_000
         const val HOST_CLOSE_TIMEOUT_MS: Long = 5_000
 
+        /** Текст отказа при `tls != null` и хосте без TLS (без адресов и секретов). */
+        const val TLS_HOST_REQUIRED: String =
+            "MqttClientOptions.tls is set, but the host does not apply TLS: use MqttClient(options) on JVM"
+
         /** Номер временной группы — растёт в процессе. */
         fun nextTemporary(): Long = temporaryCounter.incrementAndGet()
 
         private fun closedError(): MqttError = MqttError.Io("closed", null)
     }
 }
-
-@OptIn(MqttCoreApi::class)
-private fun MqttClientOptions.toEngineOptions(): EngineOptions = EngineOptions(
-    host = host,
-    port = port,
-    session = SessionSettings(
-        version = version,
-        clientId = clientId,
-        credentials = credentials?.let { SessionCredentials(it.username, it.password) },
-        keepAliveSec = keepAlive.inWholeSeconds.toInt(),
-        will = will?.let { WillSpec(it.topic, it.payload, it.retain, it.qos) },
-        connackTimeoutMs = connackTimeout.inWholeMilliseconds,
-        closeLingerMs = closeLinger.inWholeMilliseconds,
-        maxIncomingPacket = limits.maxIncomingPacket,
-        maxTopicLength = limits.maxTopicLength,
-    ),
-    connectTimeoutMs = connectTimeout.inWholeMilliseconds,
-    reconnect = reconnect,
-    offlineCapacity = offlineQueue.capacity,
-    subscribeBatch = limits.subscribeBatch,
-    consumerStallLimitMs = limits.consumerStallLimit.inWholeMilliseconds,
-    maxFilters = limits.maxFilters,
-)
