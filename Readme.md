@@ -332,7 +332,9 @@ your side.
 - A client that closed itself still holds its I/O thread until you call `close()`.
 - A broker's redirect (`SERVER_MOVED`, `USE_ANOTHER_SERVER`) is never followed.
 - Every event is also reported to `MqttLogger` (`connected`, `disconnected`, `reconnectIn`, ...) without topics, payloads
-  or addresses.
+  or addresses. `MqttLogger.packet(direction, type, size)` reports every MQTT packet (direction, control packet type and
+  size in bytes, nothing else): an outgoing one when it is handed to the I/O host for writing, an incoming one when its
+  last byte has been read (also a packet that is then dropped as too large).
 
 ### TLS (JVM)
 
@@ -358,8 +360,14 @@ val client = MqttClient(
 - **Host name verification is on by default** (`verifyHostname = true`), also for a pinned certificate and also when you
   connect by IP address (the certificate must then contain that IP in its subject alternative names). Turn it off only
   explicitly with `verifyHostname = false`.
-- `TLSClientSettings(checkServerCertificate = false)` trusts any certificate and **also disables the host name check**,
-  whatever `verifyHostname` says. Do not use it outside tests.
+- Combinations of `TLSClientSettings.checkServerCertificate` and `verifyHostname`:
+
+  | `checkServerCertificate` | `verifyHostname` | Behaviour |
+  |---|---|---|
+  | `true` | `true` | The default: the certificate chain and the host name are checked. |
+  | `true` | `false` | The chain is checked, the host name is not. Safe with a pinned `serverCertificate`: the pinned certificate itself defines the identity of the broker (use it for a broker reached by an IP address that is not in the certificate's SAN). Weak with the system trust store: any valid certificate of any site signed by a trusted CA is accepted, so pin the certificate instead. |
+  | `false` | `true` | **Refused at creation**: the factories throw `IllegalArgumentException` ("trust-all TLS ... needs an explicit verifyHostname = false"). Without a trusted chain there is nothing to check the name against, and the client never turns the check off silently. |
+  | `false` | `false` | Full "trust all": the traffic is encrypted, but the broker is not authenticated. Only for debugging and a trusted network. |
 - Only TLS 1.2 and 1.3 are used. A client certificate can be set with `clientCertificate`, `clientCertificateKey` and
   `clientCertificatePassword`.
 - Handshake failures are reported as `MqttError.Io(kind = "ssl")` with a generic message: the address and the names from

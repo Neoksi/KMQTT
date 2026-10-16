@@ -9,6 +9,8 @@ import io.github.davidepianca98.client.internal.MqttClientImpl
  *
  * Without [MqttClientOptions.tls] the client uses plain TCP. With `tls != null` the host is built with a TLS transport
  * and the host name (and SNI) verification is on unless [MqttClientOptions.verifyHostname] is turned off explicitly.
+ * "Trust all" (`TLSClientSettings.checkServerCertificate = false`) with `verifyHostname = true` is refused with
+ * [IllegalArgumentException]: pass `verifyHostname = false` explicitly.
  * The client never connects in plain text when `tls` is set: the common factory `MqttClient(options, host, clock)`
  * throws for `tls != null`, because it cannot know that a given host applies TLS.
  *

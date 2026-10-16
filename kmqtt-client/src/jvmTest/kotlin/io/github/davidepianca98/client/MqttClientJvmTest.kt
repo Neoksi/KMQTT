@@ -1,6 +1,7 @@
 package io.github.davidepianca98.client
 
 import io.github.davidepianca98.client.core.BrokerScript
+import io.github.davidepianca98.client.internal.MqttClientImpl
 import io.github.davidepianca98.mqtt.MQTTVersion
 import io.github.davidepianca98.mqtt.broker.Broker
 import io.github.davidepianca98.socket.tls.TLSClientSettings
@@ -25,6 +26,7 @@ import kotlin.test.assertEquals
 import kotlin.test.assertFailsWith
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
+import kotlin.test.assertTrue
 import kotlin.test.fail
 import kotlin.time.Duration.Companion.seconds
 
@@ -163,6 +165,43 @@ class MqttClientJvmTest {
             options("127.0.0.1", server.localPort, TLSClientSettings(serverCertificate = serverPem), verifyHostname = false),
         )
         assertIs<ConnectResult.Connected>(withTimeout(10_000) { client.connect() })
+    }
+
+    /**
+     * SEVEN-258 (решение владельца 2026-10-16): «доверять всем» при умолчании `verifyHostname = true` — ошибка
+     * конфигурации при создании, без адреса и секретов в тексте. В т. ч. с закреплённым PEM: флаг `false` и там
+     * выключает проверку имени, поэтому тоже требует явного `verifyHostname = false`.
+     */
+    @Test
+    fun trustAllWithDefaultHostnameCheckIsRefusedAtCreation() {
+        val settings = listOf(
+            TLSClientSettings(checkServerCertificate = false, clientCertificatePassword = "tls-pass"),
+            TLSClientSettings(serverCertificate = serverPem, checkServerCertificate = false),
+        )
+        for (tls in settings) {
+            val options = options("broker.test", 8883, tls)
+            val error = assertFailsWith<IllegalArgumentException> { MqttClient(options) }
+            val message = error.message.orEmpty()
+            assertEquals(MqttClientImpl.TRUST_ALL_NEEDS_NO_HOSTNAME, message)
+            for (detail in listOf("broker.test", "8883", "tls-pass")) assertFalse(detail in message, message)
+            // Проверка — в самом клиенте, через который идёт любая фабрика (и хост, применяющий TLS, её не обходит)
+            val host = NioActorHost()
+            assertFailsWith<IllegalArgumentException> {
+                MqttClientImpl(options, host, MqttClock.Monotonic, hostAppliesTls = true)
+            }
+            assertFalse(Thread.getAllStackTraces().keys.any { it.name == host.name }, "поток хоста не запускался")
+        }
+    }
+
+    @Test
+    fun trustAllWithExplicitlyDisabledHostnameCheckConnectsByIp() = runBlocking<Unit> {
+        val server = tlsServer()
+        val seen = serveOnce(server)
+        val tls = TLSClientSettings(checkServerCertificate = false)
+        val client = client(options("127.0.0.1", server.localPort, tls, verifyHostname = false))
+        assertIs<ConnectResult.Connected>(withTimeout(10_000) { client.connect() })
+        assertEquals(0x10, seen.poll(10, TimeUnit.SECONDS), "сервер расшифровал CONNECT")
+        assertTrue(client.connection.value is ConnectionState.Connected)
     }
 
     @Test

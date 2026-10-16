@@ -49,6 +49,8 @@ public fun NioTransportFactory.Companion.tls(
  *   настроек). SNI — по имени хоста. Проверка имени хоста (`endpointIdentificationAlgorithm = "HTTPS"`) включена,
  *   если проверяется сертификат сервера (`checkServerCertificate = true`, в т. ч. с `serverCertificate`) и
  *   [verifyHostname] не выключен; при `checkServerCertificate = false` (доверять всем) не проверяется ничего.
+ *   Фасад (`MqttClient`) такую комбинацию с `verifyHostname = true` не пропускает (SEVEN-258); этот уровень
+ *   (`@MqttCoreApi`) её не проверяет — за явность отвечает тот, кто собирает хост сам.
  * - Буферы — по `SSLSession.packetBufferSize`/`applicationBufferSize` (растут, если сессия их увеличила).
  *   Каждая TLS-запись уходит во внутренний транспорт отдельным массивом (он не копирует).
  * - Ошибка TLS (рукопожатие, запись) — [TransportEvent.Failed] с [MqttError.Io] `kind = "ssl"`. Причина — исключение

@@ -1,6 +1,7 @@
 package io.github.davidepianca98.client
 
 import io.github.davidepianca98.mqtt.MQTTVersion
+import io.github.davidepianca98.mqtt.packets.MQTTControlPacketType
 import io.github.davidepianca98.mqtt.packets.Qos
 import io.github.davidepianca98.mqtt.packets.mqttv5.ReasonCode
 import io.github.davidepianca98.socket.tls.TLSClientSettings
@@ -31,11 +32,21 @@ import kotlin.time.Duration.Companion.seconds
  *   factory `MqttClient(options)` builds a TLS host; the common factory `MqttClient(options, host, clock)` refuses
  *   options with `tls != null` ([IllegalArgumentException]), so a client with `tls` never connects in plain text.
  *   ALPN protocols and an explicit SNI name come from [TLSClientSettings.alpnProtocols] and
- *   [TLSClientSettings.serverNameIndications].
+ *   [TLSClientSettings.serverNameIndications]. [TLSClientSettings.checkServerCertificate] `= false` ("trust all")
+ *   requires an explicit `verifyHostname = false`, see [verifyHostname].
  * @param verifyHostname check that the certificate of the broker matches the host name (and SNI). **Enabled by
  *   default**, also for a pinned certificate and a connection by IP address; it is turned off only explicitly. It has no
- *   effect without [tls]. Note that [TLSClientSettings.checkServerCertificate] set to `false` trusts any certificate
- *   and disables the host name check regardless of this flag.
+ *   effect without [tls]. Combinations of [TLSClientSettings.checkServerCertificate] (`check`) and this flag (`verify`):
+ *   - `check = true, verify = true` (the default): the certificate chain and the host name are checked.
+ *   - `check = true, verify = false`: the chain is checked, the host name is not. Safe with a pinned
+ *     [TLSClientSettings.serverCertificate]: the pinned certificate itself defines the identity of the broker (use it
+ *     for a broker reached by an IP address that is not in the certificate's SAN). Weak with the system CA store: any
+ *     valid certificate of any site signed by a trusted CA is accepted, so pin the certificate instead.
+ *   - `check = false, verify = true`: a configuration error. The client factories throw [IllegalArgumentException]
+ *     at creation ("trust-all TLS ... needs an explicit verifyHostname = false"); without a trusted chain there is
+ *     nothing to check the name against, and the client never turns the check off silently.
+ *   - `check = false, verify = false`: full "trust all". The traffic is encrypted, but the broker is not
+ *     authenticated: only for debugging and a trusted network.
  * @param clientId MQTT client identifier; `null` generates a random one. It must be unique on the broker, because a
  *   second connection with the same identifier makes the broker drop the first.
  * @param keepAlive MQTT keep-alive interval, 0..65535 seconds; zero disables keep-alive. The protocol carries whole
@@ -217,10 +228,28 @@ public interface MqttLogger {
     /** [MqttSubscriptions.set] was refused: the groups would hold [filters] distinct filters with a limit of [limit]. */
     public fun groupRejected(filters: Int, limit: Int) {}
 
+    /**
+     * An MQTT packet of [type] and [size] bytes (fixed header included) went out or came in; nothing else about the
+     * packet is reported. An [PacketDirection.Outgoing] packet is reported when the client hands it to the I/O host for
+     * writing (not when the broker received it), an [PacketDirection.Incoming] one when its last byte has been read,
+     * before the client handles it (also a packet that is then dropped as too large, or one that ends the session as a
+     * protocol error).
+     */
+    public fun packet(direction: PacketDirection, type: MQTTControlPacketType, size: Int) {}
+
     public companion object {
         /** A logger that records nothing. */
         public val None: MqttLogger = object : MqttLogger {
             override fun toString(): String = "MqttLogger.None"
         }
     }
+}
+
+/** Direction of a packet in [MqttLogger.packet]. */
+public enum class PacketDirection {
+    /** From the client to the broker. */
+    Outgoing,
+
+    /** From the broker to the client. */
+    Incoming,
 }

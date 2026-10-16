@@ -11,6 +11,8 @@ import io.github.davidepianca98.client.MqttClock
 import io.github.davidepianca98.client.MqttError
 import io.github.davidepianca98.client.MqttHost
 import io.github.davidepianca98.client.MqttIncoming
+import io.github.davidepianca98.client.MqttLogger
+import io.github.davidepianca98.client.PacketDirection
 import io.github.davidepianca98.client.MqttSubscriptions
 import io.github.davidepianca98.client.MqttSubscriptionsImpl
 import io.github.davidepianca98.client.PublishFailure
@@ -23,6 +25,7 @@ import io.github.davidepianca98.client.engine.EngineCommand
 import io.github.davidepianca98.client.engine.EngineLogEvent
 import io.github.davidepianca98.client.engine.MqttClientEngine
 import io.github.davidepianca98.client.engine.PublishTicket
+import io.github.davidepianca98.mqtt.packets.MQTTControlPacketType
 import io.github.davidepianca98.mqtt.packets.Qos
 import kotlinx.atomicfu.atomic
 import kotlinx.atomicfu.locks.reentrantLock
@@ -55,6 +58,13 @@ private val temporaryCounter = atomic(0L)
  * Безопасность (решение владельца 2026-10-16, S06b-T05b): при `config.tls != null` клиент создаётся только с хостом,
  * который сам применяет TLS ([hostAppliesTls] — его ставит jvm-фабрика `MqttClient(options)`); иначе — отказ
  * `IllegalArgumentException` при создании, до запуска хоста: никогда не подключаться открытым текстом.
+ * Так же при создании отказывает комбинация `tls.checkServerCertificate = false` и `verifyHostname = true`
+ * ([TRUST_ALL_NEEDS_NO_HOSTNAME], SEVEN-258): проверка в одном месте, через которое проходит любая фабрика.
+ *
+ * `MqttLogger.packet` (SEVEN-258, W6 §4.8) — здесь, а не в ядре: исходящие — по каждому `HostAction.Write` (ядро
+ * склеивает в нём целые пакеты, границы совпадают с началом записи), входящие — по потоку `TransportEvent.Bytes` того
+ * подключения, которое кормит ядро ([PacketScanner], сброс на каждый `Connect`/`Connected`). С [MqttLogger.None] не
+ * считается ничего.
  */
 @OptIn(MqttCoreApi::class)
 internal class MqttClientImpl(
@@ -65,6 +75,9 @@ internal class MqttClientImpl(
 ) : MqttClient, HostDriver {
     init {
         require(config.tls == null || hostAppliesTls) { TLS_HOST_REQUIRED }
+        // Решение владельца 2026-10-16 (SEVEN-258, D4 ревью G1): «доверять всем» не проверяет имя хоста — это
+        // должно быть сказано явно (`verifyHostname = false`), а не молча при умолчании `true`
+        require(config.tls?.checkServerCertificate != false || !config.verifyHostname) { TRUST_ALL_NEEDS_NO_HOSTNAME }
     }
 
     private val engine = MqttClientEngine(config.toEngineOptions(), nextEpoch = { epochCounter.incrementAndGet() })
@@ -92,6 +105,10 @@ internal class MqttClientImpl(
     private var wroteThisStep = false
     private var rejectedGroup: String? = null
     private var now = 0L
+
+    private val packetLog = config.logger !== MqttLogger.None
+    private val incomingPackets = PacketScanner { type, size -> logPacket(PacketDirection.Incoming, type, size) }
+    private val outgoingPackets = PacketScanner { type, size -> logPacket(PacketDirection.Outgoing, type, size) }
 
     override val connection: StateFlow<ConnectionState> = stateFlow.asStateFlow()
     override val subscriptions: MqttSubscriptions get() = subs
@@ -197,6 +214,7 @@ internal class MqttClientImpl(
         drainOverflow(out)
         while (true) handle(requests.tryReceive().getOrNull() ?: break, out)
         for (event in events) {
+            if (packetLog) observeIncoming(event)
             engine.onTransport(event, nowMs)
             process(out)
         }
@@ -267,10 +285,15 @@ internal class MqttClientImpl(
         when (action) {
             is EngineAction.Connect -> {
                 wroteThisStep = false
+                if (packetLog) incomingPackets.reset()
                 out += HostAction.Connect(action.host, action.port, action.timeoutMs)
             }
             is EngineAction.Write -> {
                 wroteThisStep = true
+                if (packetLog) {
+                    outgoingPackets.reset()
+                    outgoingPackets.feed(action.bytes)
+                }
                 out += HostAction.Write(action.bytes)
             }
             EngineAction.CloseTransport -> {
@@ -346,6 +369,17 @@ internal class MqttClientImpl(
         }
     }
 
+    private fun observeIncoming(event: TransportEvent) {
+        when (event) {
+            TransportEvent.Connected -> incomingPackets.reset()
+            is TransportEvent.Bytes -> incomingPackets.feed(event.bytes)
+            else -> Unit
+        }
+    }
+
+    private fun logPacket(direction: PacketDirection, type: MQTTControlPacketType, size: Int) =
+        safeLog { packet(direction, type, size) }
+
     private inline fun safeLog(block: io.github.davidepianca98.client.MqttLogger.() -> Unit) {
         try {
             config.logger.block()
@@ -405,6 +439,10 @@ internal class MqttClientImpl(
         /** Текст отказа при `tls != null` и хосте без TLS (без адресов и секретов). */
         const val TLS_HOST_REQUIRED: String =
             "MqttClientOptions.tls is set, but the host does not apply TLS: use MqttClient(options) on JVM"
+
+        /** Текст отказа при `tls.checkServerCertificate = false` и `verifyHostname = true` (без адресов и секретов). */
+        const val TRUST_ALL_NEEDS_NO_HOSTNAME: String =
+            "MqttClientOptions: trust-all TLS (checkServerCertificate = false) needs an explicit verifyHostname = false"
 
         /** Номер временной группы — растёт в процессе. */
         fun nextTemporary(): Long = temporaryCounter.incrementAndGet()
