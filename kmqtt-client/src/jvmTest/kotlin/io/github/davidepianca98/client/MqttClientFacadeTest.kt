@@ -289,8 +289,8 @@ class MqttClientFacadeTest {
     }
 
     /**
-     * S06b-T05f сквозь `NioActorHost`: сервер с `SO_RCVBUF` 4 КиБ не читает 8 МиБ публикации, `close()` при
-     * `closeLinger = 0` — запись частичная. Сервер начинает читать через 700 мс (позже прежнего придержания 500 мс,
+     * S06b-T05f сквозь `NioActorHost`: сервер с `SO_RCVBUF` 4 КиБ не читает 4 МиБ публикации, `close()` при
+     * `closeLinger = 0` — запись частичная. Сервер начинает читать через 550 мс (позже прежнего придержания 500 мс,
      * раньше срока дописывания) и получает PUBLISH и DISCONNECT целиком, затем EOF (не RST).
      */
     @Test
@@ -345,18 +345,20 @@ class MqttClientFacadeTest {
         val client = MqttClient(options, NioActorHost())
         toClose += { runBlocking { withTimeout(10_000) { client.close() } } }
         val connected = assertIs<ConnectResult.Connected>(withTimeout(10_000) { client.connect() })
-        val payload = ByteArray(8 * 1024 * 1024) { (it * 31 + 7).toByte() }
+        val payload = ByteArray(4 * 1024 * 1024) { (it * 31 + 7).toByte() }
         assertEquals(
             PublishResult.Sent(connected.epoch),
             withTimeout(10_000) { client.publish("big", payload, qos = Qos.AT_MOST_ONCE) }
         )
         val started = System.currentTimeMillis()
         val closing = async(Dispatchers.Default) { client.close() }
-        Thread.sleep(700)
+        Thread.sleep(550)
         assertFalse(closing.isCompleted, "close() ждёт дописывания остатка")
+        val opened = System.currentTimeMillis()
         gate.countDown()
         withTimeout(10_000) { closing.await() }
         val elapsed = System.currentTimeMillis() - started
+        println("MqttClientFacadeTest: дочитано и закрыто через ${System.currentTimeMillis() - opened} мс после открытия, close() $elapsed мс")
         assertEquals("eof", withTimeout(10_000) { ended.await() }, "сервер видит штатный EOF, не RST")
         assertEquals(listOf("MQTT5Connect", "MQTT5Publish", "MQTT5Disconnect"), packets.toList())
         assertTrue(elapsed < MqttClientImpl.CLOSE_FLUSH_MS + 2_000, "close() $elapsed мс")

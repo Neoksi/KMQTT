@@ -36,7 +36,7 @@ import kotlin.time.Duration.Companion.seconds
 
 /**
  * Фасад [MqttClient] на виртуальном времени (S06b-T05b, W6 §7.1): [VirtualHost] крутит `runOnce` в `runTest`,
- * [FakeBroker]/[FakeTransport] отвечают пакетами. Сроки (TTL, linger, удержание DISCONNECT, предел паузы потребителя,
+ * [FakeBroker]/[FakeTransport] отвечают пакетами. Сроки (TTL, linger, дописывание DISCONNECT, предел паузы потребителя,
  * переподключение) проверяются точно по виртуальным часам.
  */
 class MqttClientVirtualTest {
