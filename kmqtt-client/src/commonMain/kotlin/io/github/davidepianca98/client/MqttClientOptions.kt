@@ -174,8 +174,11 @@ public data class OfflineQueue(val ttl: Duration = 10.seconds, val capacity: Int
  * @param subscribeBatch number of filters in one SUBSCRIBE or UNSUBSCRIBE packet.
  * @param maxFilters number of distinct filters over all groups; a set that would exceed it is refused (the group stays
  *   unchanged, see [MqttSubscriptions.set]).
- * @param commandQueue reserved. The request queue of the client is currently unbounded; the value is validated but not
- *   applied.
+ * @param commandQueue number of publications that may wait in the request queue of the client until its I/O thread takes
+ *   them. One more [MqttClient.publish] fails at once with [PublishFailure.QueueFull] (the caller is never blocked);
+ *   this only happens when the I/O thread falls behind, because every caller of `publish` waits for its outcome. Other
+ *   requests (subscription changes, cancellation, close) are not limited and never dropped: each of them is bounded by
+ *   the caller (one request per call, the set of filters by [maxFilters]).
  */
 public data class MqttLimits(
     val maxIncomingPacket: Int = 256 * 1024,

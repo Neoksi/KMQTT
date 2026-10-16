@@ -147,7 +147,10 @@ public sealed interface PublishFailure {
      */
     public data class Rejected(val code: ReasonCode?) : PublishFailure
 
-    /** The offline queue is full ([OfflineQueue.capacity]). */
+    /**
+     * A queue is full: the offline queue ([OfflineQueue.capacity]), or the request queue of the client
+     * ([MqttLimits.commandQueue] publications not yet taken by the I/O thread).
+     */
     public data object QueueFull : PublishFailure
 }
 

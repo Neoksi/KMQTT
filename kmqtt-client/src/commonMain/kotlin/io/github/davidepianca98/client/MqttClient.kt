@@ -90,7 +90,9 @@ public interface MqttClient {
      * Without a live session, or while the broker's receive window is full, the publication waits in the offline queue
      * ([MqttClientOptions.offlineQueue]) for at most [ttl]. The queue is FIFO and keeps the order of calls. A
      * publication that was written but not acknowledged when the connection broke is not re-sent after reconnecting
-     * (the new session is clean): it fails with [PublishFailure.ConnectionLost] if `until = Delivered`.
+     * (the new session is clean): it fails with [PublishFailure.ConnectionLost] if `until = Delivered`. If
+     * [MqttLimits.commandQueue] publications are already waiting for the I/O thread to take them, the call fails at once
+     * with [PublishFailure.QueueFull] instead of queueing (this happens only when the I/O thread falls behind).
      *
      * Cancelling the calling coroutine before the packet was written removes the publication from the queue; after the
      * write it only stops waiting for the outcome.

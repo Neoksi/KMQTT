@@ -230,6 +230,28 @@ class MqttClientFacadeTest {
         assertFailsWith<IllegalStateException> { client.incoming.take(1).toList() }
     }
 
+    /**
+     * `MqttLimits.commandQueue` (SEVEN-260): публикации сверх предела, ещё не взятые потоком хоста, отказываются сразу
+     * `QueueFull`; взятые хостом место освобождают; служебные запросы не ограничиваются и не теряются.
+     */
+    @Test
+    fun publicationsBeyondCommandQueueFailAtOnceWithQueueFull() = runBlocking<Unit> {
+        val host = ManualHost()
+        val client = MqttClient(options().copy(limits = MqttLimits(commandQueue = 2)), host)
+        val first = async(Dispatchers.Default, CoroutineStart.UNDISPATCHED) { client.publish("a", byteArrayOf(1)) }
+        val second = async(Dispatchers.Default, CoroutineStart.UNDISPATCHED) { client.publish("a", byteArrayOf(2)) }
+        assertEquals(PublishResult.Failed(PublishFailure.QueueFull), client.publish("a", byteArrayOf(3)))
+        repeat(5) { client.start() } // служебные запросы сверх предела принимаются
+        // хост взял обе публикации (оффлайн-очередь) — место освободилось
+        assertIs<HostAction.Connect>(host.step(0).actions.single())
+        val third = async(Dispatchers.Default, CoroutineStart.UNDISPATCHED) { client.publish("a", byteArrayOf(4)) }
+        written(host.step(1, TransportEvent.Connected))
+        val sent = written(host.step(2, TransportEvent.Bytes(script.connack())))
+        assertEquals(listOf(1, 2, 4), sent.filterIsInstance<MQTT5Publish>().map { it.payload!!.single().toInt() })
+        for (d in listOf(first, second, third)) assertIs<PublishResult.Sent>(withTimeout(5_000) { d.await() })
+        closeDriven(client, host, from = 3)
+    }
+
     /** D2 (SEVEN-260): удержанные сверх канала, включая `SessionEnded` штатного закрытия, не теряются при `close()`. */
     @Test
     fun closeDeliversMessagesHeldBeyondTheBufferAndSessionEnded() = runBlocking<Unit> {

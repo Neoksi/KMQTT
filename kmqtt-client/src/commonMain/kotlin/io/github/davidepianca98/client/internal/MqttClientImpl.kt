@@ -97,6 +97,9 @@ internal class MqttClientImpl(
     private var lifecycle = NEW // под lock
     private val collected = atomic(false)
     private val tickets = atomic(0L)
+
+    /** Публикации в очереди запросов, ещё не взятые потоком хоста (`MqttLimits.commandQueue`, SEVEN-260). */
+    private val queuedPublishes = atomic(0)
     private val finalized = atomic(false)
 
     /**
@@ -152,7 +155,7 @@ internal class MqttClientImpl(
         val ttlMs = ttl.inWholeMilliseconds.coerceAtLeast(0)
         val result = CompletableDeferred<PublishResult>()
         val command = EngineCommand.Publish(ticket, topic, payload, qos, retain, ttlMs, until)
-        if (!submit(ClientRequest.Publish(command, result))) return PublishResult.Failed(PublishFailure.Closed)
+        submitOrRefuse(ClientRequest.Publish(command, result))?.let { return PublishResult.Failed(it) }
         try {
             return result.await()
         } catch (e: CancellationException) {
@@ -190,9 +193,21 @@ internal class MqttClientImpl(
     }
 
     /** Положить запрос в очередь и разбудить хост (первый запрос запускает хост); `false` — клиент закрывается. */
-    private fun submit(request: ClientRequest): Boolean {
+    private fun submit(request: ClientRequest): Boolean = submitOrRefuse(request) == null
+
+    /**
+     * [submit] с причиной отказа: `null` — принято; [PublishFailure.Closed] — клиент закрывается;
+     * [PublishFailure.QueueFull] — публикация, а в очереди уже `MqttLimits.commandQueue` публикаций, которые поток хоста
+     * ещё не взял (отказ сразу, вызывающий не блокируется; служебные запросы не ограничиваются).
+     */
+    private fun submitOrRefuse(request: ClientRequest): PublishFailure? {
         lock.withLock {
-            if (lifecycle != NEW && lifecycle != RUNNING) return false
+            if (lifecycle != NEW && lifecycle != RUNNING) return PublishFailure.Closed
+            if (request is ClientRequest.Publish) {
+                // Проверка и счёт — под lock: параллельные вызовы не превысят предел; уменьшает поток хоста
+                if (queuedPublishes.value >= config.limits.commandQueue) return PublishFailure.QueueFull
+                queuedPublishes.incrementAndGet()
+            }
             requests.trySend(request)
             if (lifecycle == NEW) {
                 lifecycle = RUNNING
@@ -206,7 +221,7 @@ internal class MqttClientImpl(
             }
         }
         host.wakeup()
-        return true
+        return null
     }
 
     // ---- HostDriver: поток хоста ----
@@ -263,6 +278,7 @@ internal class MqttClientImpl(
                 if (command is EngineCommand.SetGroup) subs.onSetGroup(command, rejectedGroup == command.group)
             }
             is ClientRequest.Publish -> {
+                queuedPublishes.decrementAndGet()
                 publishes[request.command.ticket] = request.result
                 engine.onCommand(request.command, now)
                 process(out)
@@ -466,7 +482,10 @@ internal class MqttClientImpl(
 
     private fun reject(request: ClientRequest) {
         when (request) {
-            is ClientRequest.Publish -> request.result.complete(PublishResult.Failed(PublishFailure.Closed))
+            is ClientRequest.Publish -> {
+                queuedPublishes.decrementAndGet()
+                request.result.complete(PublishResult.Failed(PublishFailure.Closed))
+            }
             is ClientRequest.AwaitConnect -> request.result.complete(ConnectResult.Failed(closedError()))
             is ClientRequest.AwaitApplied -> request.result.completeExceptionally(IllegalStateException("MqttClient closed"))
             is ClientRequest.TemporaryStart -> request.refused.completeExceptionally(IllegalStateException("MqttClient closed"))

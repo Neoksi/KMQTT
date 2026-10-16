@@ -244,6 +244,8 @@ Details worth knowing:
 - Publications and subscription changes reach the socket in the order of the calls.
 - Without a connection a publication waits in the offline queue (`MqttClientOptions.offlineQueue`) for at most `ttl`.
   Anything that expired is never sent afterwards, which is the point: do not turn a light on ten minutes late.
+- `QueueFull` comes from the offline queue (`OfflineQueue.capacity`) or, at once and without blocking, when
+  `MqttLimits.commandQueue` publications (1024) are already waiting for the I/O thread to take them.
 - Every session uses a clean start. A publication written but not acknowledged when the connection breaks is not re-sent
   after reconnecting; with `until = Delivered` you get `Failed(ConnectionLost)` and decide yourself whether to retry.
 - With MQTT 3.1.1 there is no failure code in PUBACK, so `Delivered` does not prove that the broker's access control let
@@ -412,16 +414,15 @@ The broker never publishes the will after an orderly close.
   tests concentrate on QoS 0 and 1.
 - **I/O host on the JVM only.** There is no host for JavaScript or native targets. A custom host implements `MqttHost`
   (plus `HostDriver`, `MqttTransport`, ...), which is experimental API marked `@MqttCoreApi` and may change.
-- `MqttLimits.commandQueue` is reserved: the request queue is currently unbounded. The `clock` parameter of the common
-  factory is accepted but the time comes from the host loop.
+- The `clock` parameter of the common factory is accepted but the time comes from the host loop.
 - A client that closes itself keeps its thread until `close()` is called.
 
 ### Security
 
 - Passwords, the payload and topic of the will, topics, filters and addresses never appear in `toString()` of the public
   types, in `MqttError` or in `MqttLogger` events. `MqttError.Io` prints only the class name of its cause.
-- Memory is bounded by `MqttLimits` (packet size, topic length, incoming buffer, number of filters) and
-  `OfflineQueue.capacity`; a violation gives a typed outcome, not an `OutOfMemoryError`.
+- Memory is bounded by `MqttLimits` (packet size, topic length, incoming buffer, number of filters, publications in the
+  request queue) and `OfflineQueue.capacity`; a violation gives a typed outcome, not an `OutOfMemoryError`.
 - The client never falls back from TLS to plain text, and verifies the host name unless you turn that off explicitly.
 - See [TLS](#tls-jvm) for `checkServerCertificate` and `TLSClientSettings.toString()`.
 
