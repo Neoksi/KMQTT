@@ -93,3 +93,18 @@ public sealed interface PublishFailure {
     /** Оффлайн-очередь заполнена. */
     public data object QueueFull : PublishFailure
 }
+
+// ---- S06b-T05a: результат MqttClient.connect() ----
+
+/** Результат [MqttClient.connect]: первый CONNACK или конец клиента. */
+public sealed interface ConnectResult {
+    /** Сессия [epoch] установлена. */
+    public data class Connected(val epoch: Long, val server: ServerInfo) : ConnectResult
+
+    /**
+     * Клиент закрылся, не подключившись: [ReconnectPolicy.Never]/исчерпан `maxAttempts` (ошибка последней попытки,
+     * например [MqttError.Refused] — по её коду `MQTTTestConnection` выбирает другую версию) или вызван `close()`
+     * ([MqttError.Io] с `kind = "closed"`).
+     */
+    public data class Failed(val error: MqttError) : ConnectResult
+}
