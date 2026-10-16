@@ -10,6 +10,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import java.util.concurrent.CopyOnWriteArrayList
+import java.util.concurrent.atomic.AtomicLong
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertIs
@@ -81,12 +82,54 @@ internal class MqttClientBrokerTest : BrokerTestBase() {
         it[1] = (i shr 8).toByte()
     }
 
+    /**
+     * Диагностика SEVEN-259: переходы `connection`, границы сессий в `incoming`, ход потребителя (каждые 100 сообщений)
+     * и фактическая длительность сна потребителя; печатается в конце теста и при провале.
+     */
+    private class SlowDiag(val label: String) {
+        val startedAtMs = System.currentTimeMillis()
+        private val t0 = System.nanoTime()
+        val events = CopyOnWriteArrayList<String>()
+        val sleeps = AtomicLong()
+        val sleptNs = AtomicLong()
+
+        fun ms() = (System.nanoTime() - t0) / 1_000_000
+
+        fun note(text: String) {
+            events += "${ms()} мс: $text"
+        }
+
+        fun dump(outcome: String, extra: String) {
+            val n = sleeps.get()
+            val avg = if (n == 0L) 0.0 else sleptNs.get() / 1e6 / n
+            println("SEVEN259 $label $outcome за ${ms()} мс; сон потребителя: $n раз, в среднем ${"%.2f".format(avg)} мс; $extra")
+            events.forEach { println("SEVEN259 $label   $it") }
+        }
+
+        fun <T> around(extra: () -> String, block: () -> T): T = try {
+            block().also { dump("OK", extra()) }
+        } catch (t: Throwable) {
+            dump("FAIL ${t::class.simpleName}: ${t.message}", extra())
+            throw t
+        }
+    }
+
+    private fun watch(client: MqttClient, diag: SlowDiag) = scope.launch {
+        client.connection.collect { diag.note("connection $it") }
+    }
+
     /** Медленный потребитель: элемент раз в 5 мс (блокирующий сон — на Windows `delay(5)` округляется до ~15 мс). */
-    private fun slowConsumer(client: MqttClient, seen: MutableList<Int>) = scope.launch {
+    private fun slowConsumer(client: MqttClient, seen: MutableList<Int>, diag: SlowDiag) = scope.launch {
         client.incoming.collect {
             if (it is MqttIncoming.Message) {
                 seen += sequence(it)
+                if (seen.size % 100 == 0) diag.note("потребитель: ${seen.size}")
+                val started = System.nanoTime()
                 Thread.sleep(5)
+                diag.sleptNs.addAndGet(System.nanoTime() - started)
+                diag.sleeps.incrementAndGet()
+            } else {
+                diag.note("incoming $it")
             }
         }
     }
@@ -104,11 +147,21 @@ internal class MqttClientBrokerTest : BrokerTestBase() {
      * (32 КиБ по умолчанию) — дефект брокера, не клиента, см. [TestBroker.DEFAULT_MAX_PACKET].
      */
     @Test
-    fun slowConsumerLosesNothingThroughBroker() = timed {
+    fun slowConsumerLosesNothingThroughBroker() {
+        val diag = SlowDiag("broker")
+        val seen = CopyOnWriteArrayList<Int>()
+        var sub: MqttClient? = null
+        diag.around({ "принято ${seen.size}, последнее ${seen.lastOrNull()}, connection ${sub?.connection?.value}" }) {
+            slowConsumerThroughBroker(diag, seen) { sub = it }
+        }
+    }
+
+    private fun slowConsumerThroughBroker(diag: SlowDiag, seen: MutableList<Int>, onClient: (MqttClient) -> Unit) = timed {
         val broker = broker(maximumPacketSize = TestBroker.LARGE_BUFFER)
         val sub = client(broker.port) { it.copy(limits = MqttLimits(incomingBuffer = 16)) }
-        val seen = CopyOnWriteArrayList<Int>()
-        slowConsumer(sub, seen)
+        onClient(sub)
+        watch(sub, diag)
+        slowConsumer(sub, seen, diag)
         sub.up()
         sub.subscribed("g", "bp/#")
         val pub = client(broker.port)
@@ -116,7 +169,8 @@ internal class MqttClientBrokerTest : BrokerTestBase() {
 
         // прогрев: JIT, буферы, первые соединения
         repeat(WARMUP) { pub.publish("bp/x", numbered(it, 1024), Qos.AT_LEAST_ONCE, until = PublishStage.Delivered) }
-        BrokerTestKit.waitUntil(10_000, "warmup delivered, now ${seen.size}") { seen.size == WARMUP }
+        BrokerTestKit.waitUntil(10_000, { "warmup delivered, now ${seen.size}" }) { seen.size == WARMUP }
+        diag.note("прогрев принят")
 
         // Два раунда по 1 000 (всего 2 000 публикаций): утечка видна как рост кучи между раундами; разовый рост от
         // брокера в том же процессе (его структуры, классы) в сравнение не входит
@@ -124,8 +178,11 @@ internal class MqttClientBrokerTest : BrokerTestBase() {
         val started = System.currentTimeMillis()
         repeat(2) { round ->
             seen.clear()
+            diag.note("раунд $round: публикация")
             repeat(TOTAL_BP / 2) { pub.publish("bp/x", numbered(it, 1024), Qos.AT_LEAST_ONCE) }
-            BrokerTestKit.waitUntil(25_000, "round $round: consumer got all, now ${seen.size}") { seen.size >= TOTAL_BP / 2 }
+            diag.note("раунд $round: опубликовано")
+            BrokerTestKit.waitUntil(25_000, { "round $round: consumer got all, now ${seen.size}" }) { seen.size >= TOTAL_BP / 2 }
+            diag.note("раунд $round: принято всё")
             assertEquals((0 until TOTAL_BP / 2).toList(), seen.toList(), "раунд $round: без потерь и в порядке публикации")
             heaps += BrokerTestKit.usedHeap()
         }
@@ -141,23 +198,44 @@ internal class MqttClientBrokerTest : BrokerTestBase() {
      * на каждое сообщение, куча не растёт.
      */
     @Test
-    fun slowConsumerBlocksTheSenderAndLosesNothing() = timed {
-        val server = track(RawMqttServer(MQTTVersion.MQTT5, pubackDelayMs = 0, closeAfterDisconnect = true))
-        val sub = client(server.port) { it.copy(limits = MqttLimits(incomingBuffer = 16), keepAlive = 0.seconds) }
+    fun slowConsumerBlocksTheSenderAndLosesNothing() {
+        val diag = SlowDiag("raw")
         val seen = CopyOnWriteArrayList<Int>()
-        slowConsumer(sub, seen)
+        val server = track(RawMqttServer(MQTTVersion.MQTT5, pubackDelayMs = 0, closeAfterDisconnect = true))
+        var sub: MqttClient? = null
+        diag.around({
+            "принято ${seen.size}, последнее ${seen.lastOrNull()}, connection ${sub?.connection?.value}; сервер: " +
+                "end=${server.end} (в ${server.endAtMs - diag.startedAtMs} мс), pushedBytes=${server.pushedBytes.get()}, " +
+                "pushDone=${server.pushDone.count == 0L}, receivedAcks=${server.receivedAcks.get()}, " +
+                "writeFailure=${server.writeFailure}, пакетов от клиента ${server.packetTypes.size}"
+        }) {
+            slowConsumerRaw(diag, seen, server) { sub = it }
+        }
+    }
+
+    private fun slowConsumerRaw(
+        diag: SlowDiag,
+        seen: MutableList<Int>,
+        server: RawMqttServer,
+        onClient: (MqttClient) -> Unit,
+    ) = timed {
+        val sub = client(server.port) { it.copy(limits = MqttLimits(incomingBuffer = 16), keepAlive = 0.seconds) }
+        onClient(sub)
+        watch(sub, diag)
+        slowConsumer(sub, seen, diag)
         sub.up()
 
         val heapBefore = BrokerTestKit.usedHeap()
         val started = System.currentTimeMillis()
         server.push(TOTAL_BP, PAYLOAD_16K)
-        BrokerTestKit.waitUntil(15_000, "consumer read 100, now ${seen.size}") { seen.size >= 100 }
+        BrokerTestKit.waitUntil(15_000, { "consumer read 100, now ${seen.size}" }) { seen.size >= 100 }
         val pushed = server.pushedBytes.get()
         val total = TOTAL_BP.toLong() * PAYLOAD_16K
         println("MqttClientBrokerTest.backpressure(raw): при 100 прочитанных записано ${pushed / 1024} КиБ из ${total / 1024}")
         assertTrue(pushed < total / 2, "отправитель не заблокирован: записано $pushed из $total байт")
 
-        BrokerTestKit.waitUntil(25_000, "consumer got all, now ${seen.size}") { seen.size >= TOTAL_BP }
+        BrokerTestKit.waitUntil(25_000, { "consumer got all, now ${seen.size}" }) { seen.size >= TOTAL_BP }
+        diag.note("принято всё")
         assertTrue(server.pushDone.await(5, java.util.concurrent.TimeUnit.SECONDS))
         println("MqttClientBrokerTest.backpressure(raw): $TOTAL_BP сообщений за ${System.currentTimeMillis() - started} мс")
         assertEquals((0 until TOTAL_BP).toList(), seen.toList(), "без потерь и в порядке записи")

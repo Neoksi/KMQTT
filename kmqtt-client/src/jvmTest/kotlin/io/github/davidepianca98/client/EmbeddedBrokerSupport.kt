@@ -430,10 +430,13 @@ internal abstract class BrokerTestBase {
 }
 
 internal object BrokerTestKit {
-    fun waitUntil(timeoutMs: Long, what: String, condition: () -> Boolean) {
+    fun waitUntil(timeoutMs: Long, what: String, condition: () -> Boolean) = waitUntil(timeoutMs, { what }, condition)
+
+    /** То же, но описание считается в момент провала (например, «сколько принято» — на момент таймаута, не начала). */
+    fun waitUntil(timeoutMs: Long, what: () -> String, condition: () -> Boolean) {
         val deadline = System.currentTimeMillis() + timeoutMs
         while (!condition()) {
-            if (System.currentTimeMillis() > deadline) fail("timeout $timeoutMs ms: $what")
+            if (System.currentTimeMillis() > deadline) fail("timeout $timeoutMs ms: ${what()}")
             Thread.sleep(5)
         }
     }
