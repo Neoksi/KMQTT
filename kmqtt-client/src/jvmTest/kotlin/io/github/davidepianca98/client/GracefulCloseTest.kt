@@ -36,6 +36,9 @@ internal class GracefulCloseTest : BrokerTestBase() {
 
     /** 50 PUBLISH QoS 1 + `close()`; PUBACK приходят через 100 мс — уже после DISCONNECT клиента. */
     private fun rawServerSeesEof(version: MQTTVersion, closeLinger: kotlin.time.Duration) = timed {
+        // `closeLinger = 0`: клиент не ждёт закрытия брокером; пока PUBACK ещё в пути, RST допустим (известный предел,
+        // SEVEN-252), но все PUBLISH и DISCONNECT должны дойти целиком
+        val zeroLinger = closeLinger == 0.seconds
         val server = track(RawMqttServer(version, pubackDelayMs = 100, closeAfterDisconnect = true))
         val client = client(server.port, version) { rawOptions(it).copy(closeLinger = closeLinger) }
         client.up()
@@ -45,8 +48,13 @@ internal class GracefulCloseTest : BrokerTestBase() {
         val closeMs = (System.nanoTime() - started) / 1_000_000
         println("GracefulCloseTest.rawEof($version, linger=$closeLinger): close() занял $closeMs мс")
 
-        assertEquals(RawEnd.EOF, server.awaitEnd(10_000), "сервер увидел RST вместо EOF; пакеты ${server.packetTypes}")
-        assertNull(server.writeFailure, "запись PUBACK в закрытый клиентом сокет: ${server.writeFailure}")
+        val end = server.awaitEnd(10_000)
+        if (zeroLinger) {
+            assertTrue(end == RawEnd.EOF || end == RawEnd.RESET, "конец соединения: $end")
+        } else {
+            assertEquals(RawEnd.EOF, end, "сервер увидел RST вместо EOF; пакеты ${server.packetTypes}")
+            assertNull(server.writeFailure, "запись PUBACK в закрытый клиентом сокет: ${server.writeFailure}")
+        }
         assertEquals(PUBLISHES, server.publishIds.size, "сервер получил все PUBLISH")
         // CONNECT, 50 PUBLISH, DISCONNECT — и ничего после
         assertEquals(listOf(1) + List(PUBLISHES) { 3 } + listOf(14), server.packetTypes.toList())
@@ -60,8 +68,8 @@ internal class GracefulCloseTest : BrokerTestBase() {
     fun serverReadsEofNotResetAfterFiftyPublishesMqtt311() = rawServerSeesEof(MQTTVersion.MQTT3_1_1, 3.seconds)
 
     /**
-     * `closeLinger = 0` (слабое место SEVEN-252: `CloseTransport` придерживается до EOF или 500 мс): сервер закрывает
-     * свою сторону после PUBACK — EOF, не RST.
+     * `closeLinger = 0` (SEVEN-252: хост дописывает остаток записи и закрывает канал, не дожидаясь брокера): все
+     * PUBLISH и DISCONNECT доходят целиком; конец соединения — EOF или RST (PUBACK ещё в пути — известный предел).
      */
     @Test
     fun serverReadsEofWithZeroLingerWhenServerClosesMqtt5() = rawServerSeesEof(MQTTVersion.MQTT5, 0.seconds)
@@ -107,9 +115,10 @@ internal class GracefulCloseTest : BrokerTestBase() {
         val started = System.nanoTime()
         withTimeout(10_000) { client.close() }
         println("GracefulCloseTest.zeroLingerSilent: close() занял ${(System.nanoTime() - started) / 1_000_000} мс")
-        assertEquals(RawEnd.EOF, server.awaitEnd(10_000), "пакеты ${server.packetTypes}")
-        assertNull(server.writeFailure)
+        val end = server.awaitEnd(10_000)
+        assertTrue(end == RawEnd.EOF || end == RawEnd.RESET, "конец соединения: $end; пакеты ${server.packetTypes}")
         assertEquals(PUBLISHES, server.publishIds.size)
+        assertEquals(14, server.packetTypes.last(), "DISCONNECT — последний пакет")
     }
 
     /**
