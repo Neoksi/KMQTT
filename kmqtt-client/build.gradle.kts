@@ -37,6 +37,10 @@ kotlin {
             languageSettings.apply {
                 optIn("kotlin.ExperimentalUnsignedTypes")
                 optIn("kotlinx.cinterop.ExperimentalForeignApi")
+                // SEVEN-220: ядро/движок нового клиента (@MqttCoreApi) — opt-in только для тестов, main объявляет явно
+                if (name.endsWith("Test")) {
+                    optIn("io.github.davidepianca98.client.core.MqttCoreApi")
+                }
             }
         }
         val commonMain by getting {
@@ -57,6 +61,9 @@ kotlin {
             dependencies {
                 implementation(kotlin("test"))
                 implementation(kotlin("test-junit"))
+                implementation(libs.kotlinx.coroutines.test)
+                // SEVEN-220: встроенный брокер для интеграционных тестов нового клиента (T05c)
+                implementation(project(":kmqtt-broker"))
             }
         }
         val jsMain by getting {
