@@ -64,7 +64,8 @@ public interface MqttSubscriptions {
     /**
      * Ждать SUBACK по всем фильтрам группы в текущей эпохе (нет живой сессии — ждёт подключения). Возвращает
      * состояние фильтров группы (каждое — [TopicState.Granted] или [TopicState.Refused]); пустая или неизвестная
-     * группа — сразу пустая карта. Видит все `set`, вызванные раньше. После `close()` — `IllegalStateException`.
+     * группа — сразу пустая карта. Видит все `set`, вызванные раньше. Клиент закрыт (`close()` или сам —
+     * `ReconnectPolicy.Never`/исчерпан `maxAttempts`) — `IllegalStateException`.
      */
     public suspend fun awaitApplied(group: String): Map<String, TopicState>
 
@@ -194,11 +195,17 @@ internal class MqttSubscriptionsImpl(
         temporary.remove(group)
     }
 
-    /** Клиент закончен: ожидания завершаются исключением. */
-    fun failAll() {
+    /** Клиент закрылся (сам или через `close()`): ждущие [awaitApplied] завершаются исключением. */
+    fun failWaiters() {
         val error = IllegalStateException("MqttClient closed")
         for (waiter in waiters) waiter.result.completeExceptionally(error)
         waiters.clear()
+    }
+
+    /** Клиент закончен: ожидания завершаются исключением. */
+    fun failAll() {
+        val error = IllegalStateException("MqttClient closed")
+        failWaiters()
         for (refused in temporary.values) refused.completeExceptionally(error)
         temporary.clear()
     }

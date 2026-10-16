@@ -258,7 +258,10 @@ internal class MqttClientImpl(
                 is ConnectionState.Closed -> request.result.complete(ConnectResult.Failed(state.error ?: closedError()))
                 else -> connectWaiters += request.result
             }
-            is ClientRequest.AwaitApplied -> subs.addWaiter(request)
+            is ClientRequest.AwaitApplied -> {
+                subs.addWaiter(request)
+                if (engine.state is ConnectionState.Closed) subs.failWaiters()
+            }
             is ClientRequest.TemporaryStart -> {
                 subs.temporaryStarted(request.group, request.refused)
                 handle(ClientRequest.Command(EngineCommand.SetGroup(request.group, request.filters, request.qos)), out)
@@ -349,6 +352,8 @@ internal class MqttClientImpl(
         }
         for (waiter in connectWaiters) waiter.complete(result)
         connectWaiters.clear()
+        // Клиент закрылся сам (Never/maxAttempts): SUBACK больше не будет — awaitApplied не должен висеть
+        if (state is ConnectionState.Closed) subs.failWaiters()
     }
 
     private fun log(event: EngineLogEvent) = safeLog {

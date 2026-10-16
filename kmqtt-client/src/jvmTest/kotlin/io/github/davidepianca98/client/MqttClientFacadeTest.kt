@@ -8,6 +8,7 @@ import io.github.davidepianca98.mqtt.packets.MQTTPacket
 import io.github.davidepianca98.mqtt.packets.Qos
 import io.github.davidepianca98.mqtt.packets.mqttv5.MQTT5Disconnect
 import io.github.davidepianca98.mqtt.packets.mqttv5.MQTT5Publish
+import io.github.davidepianca98.mqtt.packets.mqttv5.ReasonCode
 import io.github.davidepianca98.socket.tls.TLSClientSettings
 import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
@@ -278,6 +279,24 @@ class MqttClientFacadeTest {
         assertEquals(PublishResult.Failed(PublishFailure.Closed), client.publish("facade/x", byteArrayOf()))
         assertIs<ConnectResult.Failed>(client.connect())
         assertFailsWith<IllegalStateException> { client.subscriptions.awaitApplied("g") }
+    }
+
+    @Test
+    fun awaitAppliedFailsWhenClientClosesItself() = runBlocking<Unit> {
+        val (client, host) = connected(options())
+        client.subscriptions.set("g", setOf("a/#"))
+        val waiting = async(Dispatchers.Default, CoroutineStart.UNDISPATCHED) {
+            runCatching { client.subscriptions.awaitApplied("g") }
+        }
+        assertTrue(written(host.step(3)).isNotEmpty()) // SUBSCRIBE
+        host.step(4, TransportEvent.Bytes(script.disconnect5(ReasonCode.SERVER_SHUTTING_DOWN)))
+        assertIs<ConnectionState.Closed>(client.connection.value)
+        assertIs<IllegalStateException>(withTimeout(5_000) { waiting.await() }.exceptionOrNull())
+        val late = async(Dispatchers.Default, CoroutineStart.UNDISPATCHED) {
+            runCatching { client.subscriptions.awaitApplied("g") }
+        }
+        host.step(5)
+        assertIs<IllegalStateException>(withTimeout(5_000) { late.await() }.exceptionOrNull())
     }
 
     @Test

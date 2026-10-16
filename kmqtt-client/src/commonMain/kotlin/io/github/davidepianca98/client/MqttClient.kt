@@ -88,7 +88,8 @@ public interface MqttClient {
  * Клиент на заданном хосте цикла [host] (common: js/native компилируются без JVM-API). [clock] должен совпадать с
  * часами хоста. Хост одноразовый и принадлежит клиенту: [MqttClient.close] закрывает и его. TLS-параметры
  * [MqttClientOptions.tls]/[MqttClientOptions.verifyHostname] применяет тот, кто создаёт хост (на JVM — перегрузка
- * `MqttClient(options)` с `NioActorHost`).
+ * `MqttClient(options)` с `NioActorHost`). **Безопасность:** при `tls != null` вызывающий обязан передать хост с
+ * TLS-транспортом — публичный конструктор `NioActorHost()` создаёт только TCP, и клиент подключится открытым текстом.
  *
  * Проверка параметров — здесь же (`IllegalArgumentException`, текст без адресов и секретов).
  */
