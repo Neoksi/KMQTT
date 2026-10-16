@@ -234,7 +234,8 @@ internal class MqttClientBrokerTest : BrokerTestBase() {
             "принято ${seen.size}, последнее ${seen.lastOrNull()}, connection ${sub?.connection?.value}; сервер: " +
                 "end=${server.end?.let { "$it в ${server.endAtMs - diag.startedAtMs} мс" }}, pushedBytes=${server.pushedBytes.get()}, " +
                 "pushDone=${server.pushDone.count == 0L}, receivedAcks=${server.receivedAcks.get()}, " +
-                "writeFailure=${server.writeFailure}, пакетов от клиента ${server.packetTypes.size}"
+                "writeFailure=${server.writeFailure}, пакетов от клиента ${server.packetTypes.size}, " +
+                "соединений ${server.connections.get()}, итоги ${server.ends}"
         }) {
             slowConsumerRaw(diag, seen, server) { sub = it }
         }

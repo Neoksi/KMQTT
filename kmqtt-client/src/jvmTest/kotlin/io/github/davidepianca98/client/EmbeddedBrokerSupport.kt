@@ -118,25 +118,46 @@ internal enum class RawEnd {
 
     /** Клиент не закрыл соединение за `soTimeout` сервера. */
     TIMEOUT,
+
+    /** Ошибка самого сервера (разбор пакета и т. п.): соединение закрыто сервером, причина — [RawConnectionEnd.cause]. */
+    ERROR,
+
+    /** Сервер закрыт тестом ([RawMqttServer.close]) при живом соединении. */
+    CLOSED_BY_TEST,
+}
+
+/** Итог одного соединения сырого сервера ([index] — порядковый номер принятого соединения с нуля). */
+internal class RawConnectionEnd(val index: Int, val end: RawEnd, val atMs: Long, val cause: Throwable?) {
+    override fun toString(): String = "#$index $end" + (cause?.let { " (${it.javaClass.simpleName}: ${it.message})" } ?: "")
 }
 
 /**
- * Сырой MQTT-сервер без брокера: принимает одно соединение, отвечает CONNACK, на каждый PUBLISH QoS 1 отвечает PUBACK
- * через [pubackDelayMs] (писатель в отдельном потоке — PUBACK приходят уже после DISCONNECT клиента). Получив
- * DISCONNECT, ждёт, пока писатель отдаст все PUBACK, и (если [closeAfterDisconnect]) закрывает свою сторону
- * `shutdownOutput()` — FIN, не `close()`; затем читает, пока клиент не закроет соединение: [end] — `EOF` или `RESET`.
+ * Сырой MQTT-сервер без брокера: отвечает CONNACK, на каждый PUBLISH QoS 1 отвечает PUBACK через [pubackDelayMs]
+ * (писатель в отдельном потоке — PUBACK приходят уже после DISCONNECT клиента). Получив DISCONNECT, ждёт, пока писатель
+ * отдаст все PUBACK, и (если [closeAfterDisconnect]) закрывает свою сторону `shutdownOutput()` — FIN, не `close()`;
+ * затем читает, пока клиент не закроет соединение: [end] — `EOF` или `RESET`.
+ *
+ * Соединения (SEVEN-260): по умолчанию принимается одно; с [acceptReconnect] — и последующие (переподключение клиента
+ * после разрыва не упирается в закрытый сервер). [end], [endAtMs], [finished], [connected] относятся к **первому**
+ * соединению, итоги всех — в [ends] с причиной: разрыв клиентом (`EOF`/`RESET`), `TIMEOUT`, ошибка сервера (`ERROR` с
+ * исключением — раньше она молча обрывала соединение без итога) и закрытие тестом (`CLOSED_BY_TEST`). [describe] —
+ * сводка для сообщений о провале.
  */
 internal class RawMqttServer(
     private val version: MQTTVersion,
     private val pubackDelayMs: Long = 100,
     private val closeAfterDisconnect: Boolean = true,
     private val soTimeoutMs: Int = 15_000,
+    private val acceptReconnect: Boolean = false,
 ) : AutoCloseable {
     private val server = ServerSocket(0, 50, InetAddress.getLoopbackAddress())
     private val script = BrokerScript(version)
-    private val outbox = LinkedBlockingQueue<Pair<Long, ByteArray>>()
-    private val pendingAcks = AtomicInteger()
+
+    @Volatile
     private var socket: Socket? = null
+
+    @Volatile
+    private var closing = false
 
     val port: Int get() = server.localPort
 
@@ -146,6 +167,13 @@ internal class RawMqttServer(
     /** Типы принятых пакетов по порядку (старший полубайт первого байта: 1 CONNECT, 3 PUBLISH, 14 DISCONNECT…). */
     val packetTypes = CopyOnWriteArrayList<Int>()
 
+    /** Сколько соединений принято. */
+    val connections = AtomicInteger()
+
+    /** Итоги закончившихся соединений по порядку. */
+    val ends = CopyOnWriteArrayList<RawConnectionEnd>()
+
+    /** Итог первого соединения. */
     @Volatile
     var end: RawEnd? = null
         private set
@@ -158,11 +186,15 @@ internal class RawMqttServer(
     var disconnectAtMs: Long = 0
         private set
 
+    /** Последняя ошибка записи PUBACK/PINGRESP (любого соединения). */
     @Volatile
     var writeFailure: Throwable? = null
         private set
 
+    /** Первый CONNECT. */
     val connected = CountDownLatch(1)
+
+    /** Первое соединение закончилось. */
     val finished = CountDownLatch(1)
     private val writeLock = Any()
 
@@ -174,9 +206,18 @@ internal class RawMqttServer(
 
     val pushDone = CountDownLatch(1)
 
+    /** Состояние одного соединения: очередь ответов писателя и неотданные PUBACK — свои у каждого. */
+    private class Connection(val index: Int, val client: Socket) {
+        val outbox = LinkedBlockingQueue<Pair<Long, ByteArray>>()
+        val pendingAcks = AtomicInteger()
+
+        @Volatile
+        var writeFailure: Throwable? = null
+    }
+
     /**
-     * Сервер как источник входящих: [count] PUBLISH QoS 1 по [payloadSize] байт блокирующей записью (после CONNACK);
-     * первые два байта нагрузки — номер сообщения. Записывает столько, сколько клиент успевает читать.
+     * Сервер как источник входящих: [count] PUBLISH QoS 1 по [payloadSize] байт блокирующей записью (после CONNACK) в
+     * текущее соединение; первые два байта нагрузки — номер сообщения. Записывает столько, сколько клиент успевает читать.
      */
     fun push(count: Int, payloadSize: Int, topic: String = "push/x") {
         check(connected.await(10, TimeUnit.SECONDS)) { "клиент не подключился" }
@@ -205,20 +246,25 @@ internal class RawMqttServer(
 
     private val acceptor = thread(name = "raw-mqtt-server-$port", isDaemon = true) {
         try {
-            serve()
+            var index = 0
+            do {
+                val client = server.accept()
+                serve(Connection(index++, client))
+            } while (acceptReconnect && !closing)
         } catch (_: Throwable) {
-            // сервер закрыт тестом
+            // сервер закрыт тестом (accept)
         } finally {
             finished.countDown()
         }
     }
 
-    private fun serve() {
-        val client = server.accept()
+    private fun serve(connection: Connection) {
+        val client = connection.client
         socket = client
+        connections.incrementAndGet()
         client.tcpNoDelay = true
         client.soTimeout = soTimeoutMs
-        val writer = thread(name = "raw-mqtt-writer-$port", isDaemon = true) { writeLoop(client) }
+        val writer = thread(name = "raw-mqtt-writer-$port-${connection.index}", isDaemon = true) { writeLoop(connection) }
         val input = client.getInputStream()
         val buffer = ByteArray(16 * 1024)
         var pending = ByteArray(0)
@@ -226,34 +272,43 @@ internal class RawMqttServer(
             while (true) {
                 val read = input.read(buffer)
                 if (read < 0) {
-                    markEnd(RawEnd.EOF)
+                    markEnd(connection, RawEnd.EOF, null)
                     break
                 }
                 pending += buffer.copyOf(read)
                 while (true) {
                     val packet = takePacket(pending) ?: break
                     pending = pending.copyOfRange(packet.size, pending.size)
-                    onPacket(client, packet)
+                    onPacket(connection, packet)
                 }
             }
-        } catch (_: SocketTimeoutException) {
-            markEnd(RawEnd.TIMEOUT)
+        } catch (e: SocketTimeoutException) {
+            markEnd(connection, RawEnd.TIMEOUT, e)
         } catch (e: SocketException) {
-            markEnd(RawEnd.RESET)
+            markEnd(connection, if (closing) RawEnd.CLOSED_BY_TEST else RawEnd.RESET, e)
+        } catch (e: Exception) {
+            markEnd(connection, RawEnd.ERROR, e)
         } finally {
             writer.interrupt()
             runCatching { client.close() }
+            if (connection.index == 0) finished.countDown()
         }
     }
 
-    private fun markEnd(value: RawEnd) {
+    private fun markEnd(connection: Connection, value: RawEnd, cause: Throwable?) {
         // Ошибка записи PUBACK в закрытый клиентом сокет — тот же RST, даже если чтение успело увидеть FIN
-        val failure = writeFailure
-        end = if (failure != null && value == RawEnd.EOF) RawEnd.RESET else value
-        endAtMs = System.currentTimeMillis()
+        val failure = connection.writeFailure
+        val result = if (failure != null && value == RawEnd.EOF) RawEnd.RESET else value
+        val at = System.currentTimeMillis()
+        if (connection.index == 0) {
+            end = result
+            endAtMs = at
+        }
+        ends += RawConnectionEnd(connection.index, result, at, cause ?: failure)
     }
 
-    private fun onPacket(client: Socket, packet: ByteArray) {
+    private fun onPacket(connection: Connection, packet: ByteArray) {
+        val client = connection.client
         val type = (packet[0].toInt() and 0xFF) shr 4
         packetTypes += type
         when (type) {
@@ -270,26 +325,26 @@ internal class RawMqttServer(
                     index += 2 + topicLength
                     val id = ((packet[index].toInt() and 0xFF) shl 8) or (packet[index + 1].toInt() and 0xFF)
                     publishIds += id
-                    pendingAcks.incrementAndGet()
-                    outbox.put((System.currentTimeMillis() + pubackDelayMs) to script.puback(id))
+                    connection.pendingAcks.incrementAndGet()
+                    connection.outbox.put((System.currentTimeMillis() + pubackDelayMs) to script.puback(id))
                 }
             }
             TYPE_PUBACK -> receivedAcks.incrementAndGet()
-            TYPE_PINGREQ -> outbox.put(0L to script.pingresp())
+            TYPE_PINGREQ -> connection.outbox.put(0L to script.pingresp())
             TYPE_DISCONNECT -> {
                 disconnectAtMs = System.currentTimeMillis()
                 val deadline = System.currentTimeMillis() + 5_000
-                while (pendingAcks.get() > 0 && System.currentTimeMillis() < deadline) Thread.sleep(5)
+                while (connection.pendingAcks.get() > 0 && System.currentTimeMillis() < deadline) Thread.sleep(5)
                 if (closeAfterDisconnect) runCatching { client.shutdownOutput() }
             }
         }
     }
 
-    private fun writeLoop(client: Socket) {
+    private fun writeLoop(connection: Connection) {
         try {
-            val out = client.getOutputStream()
+            val out = connection.client.getOutputStream()
             while (true) {
-                val (due, bytes) = outbox.take()
+                val (due, bytes) = connection.outbox.take()
                 val wait = due - System.currentTimeMillis()
                 if (wait > 0) Thread.sleep(wait)
                 try {
@@ -298,9 +353,10 @@ internal class RawMqttServer(
                         out.flush()
                     }
                 } catch (e: Exception) {
+                    connection.writeFailure = e
                     writeFailure = e
                 } finally {
-                    if (due != 0L) pendingAcks.decrementAndGet()
+                    if (due != 0L) connection.pendingAcks.decrementAndGet()
                 }
             }
         } catch (_: InterruptedException) {
@@ -308,14 +364,19 @@ internal class RawMqttServer(
         }
     }
 
-    /** Ждёт, пока сервер увидит конец соединения. */
+    /** Ждёт, пока сервер увидит конец первого соединения. */
     fun awaitEnd(timeoutMs: Long): RawEnd = if (finished.await(timeoutMs, TimeUnit.MILLISECONDS)) {
-        end ?: fail("сервер завершился без итога чтения")
+        end ?: fail("сервер завершился без итога чтения; ${describe()}")
     } else {
-        fail("сервер не увидел конца соединения за $timeoutMs мс; пакеты: $packetTypes")
+        fail("сервер не увидел конца соединения за $timeoutMs мс; ${describe()}")
     }
 
+    /** Сводка для сообщений о провале: соединения, их итоги, пакеты, ошибки записи. */
+    fun describe(): String =
+        "соединений ${connections.get()}, итоги $ends, пакеты $packetTypes, ошибка записи ${writeFailure?.javaClass?.simpleName}"
+
     override fun close() {
+        closing = true
         runCatching { server.close() }
         runCatching { socket?.close() }
         acceptor.join(2_000)
