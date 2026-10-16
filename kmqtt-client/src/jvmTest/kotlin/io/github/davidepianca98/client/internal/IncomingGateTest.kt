@@ -1,5 +1,6 @@
 package io.github.davidepianca98.client.internal
 
+import kotlinx.coroutines.runBlocking
 import kotlin.random.Random
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -99,6 +100,30 @@ class IncomingGateTest {
         assertTrue(rig.gate.drain())
         assertEquals(2, rig.gate.tryTake())
         assertNull(rig.gate.tryTake())
+    }
+
+    /** D2: закрытие отдаёт канал, затем удержанные — по порядку. */
+    @Test
+    fun closeHandsHeldItemsAfterTheChannelInOrder() = runBlocking {
+        val rig = Rig(1)
+        repeat(4) { rig.gate.offer(it) }
+        rig.gate.close()
+        rig.gate.close() // повторный вызов ничего не делает
+        val taken = ArrayList<Int>()
+        rig.gate.consume { taken += it }
+        assertEquals(listOf(0, 1, 2, 3), taken)
+    }
+
+    /** Аварийный путь (D6): канал закрыт раньше хвоста — сборщик завершается после канала, хвост не доходит. */
+    @Test
+    fun closeChannelBeforeCloseDropsTheTail() = runBlocking {
+        val rig = Rig(1)
+        repeat(3) { rig.gate.offer(it) }
+        rig.gate.closeChannel()
+        val taken = ArrayList<Int>()
+        rig.gate.consume { taken += it }
+        rig.gate.close()
+        assertEquals(listOf(0), taken)
     }
 
     @Test

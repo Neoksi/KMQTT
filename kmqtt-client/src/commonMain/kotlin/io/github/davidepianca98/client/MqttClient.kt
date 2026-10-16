@@ -122,7 +122,10 @@ public interface MqttClient {
      * The broker does not publish the will after an orderly close.
      *
      * Publications that could not be sent are completed with [PublishFailure.Closed], including those held back by the
-     * broker's receive window. Closing before the CONNACK arrives closes the transport without DISCONNECT, so a broker
+     * broker's receive window. In the emergency case (the I/O thread has not stopped in time and is busy in a step, for
+     * example in a blocking [MqttLogger] callback) `close()` returns without it: publications and subscription waiters
+     * already taken by that thread complete with [PublishFailure.Closed] only when it leaves the step. Closing before the
+     * CONNACK arrives closes the transport without DISCONNECT, so a broker
      * that has already accepted the CONNECT may publish the will.
      *
      * A second call waits for the same shutdown. The call does not hang: the total time is bounded by
