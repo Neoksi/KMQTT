@@ -403,16 +403,41 @@ public class MQTTClient(
     /**
      * Disconnect the client
      *
+     * After the DISCONNECT the client waits for the server to close the connection (the server must do it) and
+     * discards what it still sends, and only then closes the socket. Closing a socket whose receive buffer holds unread
+     * replies (PUBACK, SUBACK, UNSUBACK of the last packets) makes the operating system send RST instead of FIN: the
+     * broker then loses the not yet processed tail of the stream, including this DISCONNECT, sees a dropped connection
+     * and publishes the will.
+     *
      * @param reasonCode the specific reason code (only used in MQTT5)
+     * @param lingerMs how long to wait for the server to close the connection before closing the socket anyway;
+     * 0 closes the socket at once. The wait is done by the calling thread, the one that runs the client loop
      */
-    public fun disconnect(reasonCode: ReasonCode) {
+    public fun disconnect(reasonCode: ReasonCode, lingerMs: Long = DISCONNECT_LINGER_MS) {
         val disconnect = if (mqttVersion == MQTTVersion.MQTT3_1_1) {
             MQTT4Disconnect()
         } else {
             MQTT5Disconnect(reasonCode)
         }
         send(disconnect.toByteArray())
+        if (lingerMs > 0) {
+            awaitServerClose(lingerMs)
+        }
         close()
+    }
+
+    // Reads and discards until the server closes the connection or the time is up; any failure ends the wait
+    private fun awaitServerClose(lingerMs: Long) {
+        val deadline = currentTimeMillis() + lingerMs
+        try {
+            while (currentTimeMillis() < deadline) {
+                val current = socket ?: return
+                current.sendRemaining()
+                current.read()
+            }
+        } catch (_: Exception) {
+            // The server closed the connection (end of stream) or the read failed: nothing left to wait for
+        }
     }
 
     private var lastException: Exception? = null
@@ -455,7 +480,7 @@ public class MQTTClient(
                 }
             } catch (e: MQTTException) {
                 lastException = e
-                disconnect(e.reasonCode)
+                disconnect(e.reasonCode, 0)
                 onDisconnected(null)
                 throw e
             } catch (e: EOFException) {
@@ -465,12 +490,12 @@ public class MQTTClient(
                 throw e
             } catch (e: IOException) {
                 lastException = e
-                disconnect(ReasonCode.UNSPECIFIED_ERROR)
+                disconnect(ReasonCode.UNSPECIFIED_ERROR, 0)
                 onDisconnected(null)
                 throw e
             } catch (e: Exception) {
                 lastException = e
-                disconnect(ReasonCode.IMPLEMENTATION_SPECIFIC_ERROR)
+                disconnect(ReasonCode.IMPLEMENTATION_SPECIFIC_ERROR, 0)
                 onDisconnected(null)
                 throw e
             }
@@ -567,7 +592,7 @@ public class MQTTClient(
                 }
             } finally {
                 if (running.value) {
-                    disconnect(ReasonCode.IMPLEMENTATION_SPECIFIC_ERROR)
+                    disconnect(ReasonCode.IMPLEMENTATION_SPECIFIC_ERROR, 0)
                 }
             }
         }
@@ -844,3 +869,6 @@ public class MQTTClient(
         socket = null
     }
 }
+
+// How long disconnect() waits for the server to close the connection before closing the socket itself
+private const val DISCONNECT_LINGER_MS = 3_000L
