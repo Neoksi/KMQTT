@@ -118,14 +118,41 @@ internal class MqttClientBrokerTest : BrokerTestBase() {
         client.connection.collect { diag.note("connection $it") }
     }
 
-    /** Медленный потребитель: элемент раз в 5 мс (блокирующий сон — на Windows `delay(5)` округляется до ~15 мс). */
+    /**
+     * Темп медленного потребителя по сроку, а не по числу снов (SEVEN-259): n-й элемент — не раньше `начало + n · период`.
+     * `Thread.sleep(5)` на Windows при гранулярности таймера 15,6 мс длится ~16 мс, и 2 000 элементов занимали ≥ 31 с —
+     * больше бюджета теста (30 с снаружи, 25 с на ожидание) при живом клиенте. По сроку пересып одного сна догоняется
+     * следующими элементами без сна, средний темп остаётся [CONSUMER_PERIOD_MS] при любой гранулярности. Отставание
+     * больше [CONSUMER_MAX_LAG_MS] (простой между раундами, пауза GC) — новое начало отсчёта, чтобы потребитель не
+     * «догонял» простой залпом и давление сохранялось.
+     */
+    private class Pace(private val sleep: (Long) -> Unit) {
+        private var next = 0L
+
+        fun tick() {
+            val now = System.nanoTime()
+            if (next == 0L || now - next > CONSUMER_MAX_LAG_MS * 1_000_000) next = now
+            next += CONSUMER_PERIOD_MS * 1_000_000
+            val waitMs = (next - System.nanoTime() + 999_999) / 1_000_000
+            if (waitMs > 0) sleep(waitMs)
+        }
+    }
+
+    /**
+     * Сон потребителя. Проверка устойчивости к грубому таймеру (SEVEN-259): подставить `{ Thread.sleep(16) }` — любой
+     * сон длится тик Windows 15,6 мс; тесты обязаны остаться зелёными (без [Pace] оба падали по бюджету времени).
+     */
+    private val consumerSleep: (Long) -> Unit = { Thread.sleep(it) }
+
+    /** Медленный потребитель: в среднем элемент раз в [CONSUMER_PERIOD_MS] мс (блокирующий сон по сроку, см. [Pace]). */
     private fun slowConsumer(client: MqttClient, seen: MutableList<Int>, diag: SlowDiag) = scope.launch {
+        val pace = Pace(consumerSleep)
         client.incoming.collect {
             if (it is MqttIncoming.Message) {
                 seen += sequence(it)
                 if (seen.size % 100 == 0) diag.note("потребитель: ${seen.size}")
                 val started = System.nanoTime()
-                Thread.sleep(5)
+                pace.tick()
                 diag.sleptNs.addAndGet(System.nanoTime() - started)
                 diag.sleeps.incrementAndGet()
             } else {
@@ -205,7 +232,7 @@ internal class MqttClientBrokerTest : BrokerTestBase() {
         var sub: MqttClient? = null
         diag.around({
             "принято ${seen.size}, последнее ${seen.lastOrNull()}, connection ${sub?.connection?.value}; сервер: " +
-                "end=${server.end} (в ${server.endAtMs - diag.startedAtMs} мс), pushedBytes=${server.pushedBytes.get()}, " +
+                "end=${server.end?.let { "$it в ${server.endAtMs - diag.startedAtMs} мс" }}, pushedBytes=${server.pushedBytes.get()}, " +
                 "pushDone=${server.pushDone.count == 0L}, receivedAcks=${server.receivedAcks.get()}, " +
                 "writeFailure=${server.writeFailure}, пакетов от клиента ${server.packetTypes.size}"
         }) {
@@ -496,5 +523,7 @@ internal class MqttClientBrokerTest : BrokerTestBase() {
         const val TOTAL_BP = 2_000
         const val WARMUP = 50
         const val PAYLOAD_16K = 16 * 1024
+        const val CONSUMER_PERIOD_MS = 5L
+        const val CONSUMER_MAX_LAG_MS = 100L
     }
 }
