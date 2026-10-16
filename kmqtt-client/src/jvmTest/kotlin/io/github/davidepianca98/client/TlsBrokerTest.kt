@@ -15,9 +15,8 @@ import kotlin.test.fail
 
 /**
  * TLS-сценарий фасада против встроенного брокера форка с TLS (S06b-T05c): connect / subscribe / publish / incoming
- * через `NioActorHost` с `TlsTransport`. Ключ брокера — `tls/server.p12` (SAN только `localhost`), клиент закрепляет
- * сертификат `tls/server.pem`. Хост строится внутренним конструктором с `NioTransportFactory.tls(...)`: публичный
- * `NioActorHost()` создаёт только TCP.
+ * через jvm-фабрику `MqttClient(options)` (хост с `TlsTransport`). Ключ брокера — `tls/server.p12` (SAN только `localhost`), клиент закрепляет
+ * сертификат `tls/server.pem`.
  */
 internal class TlsBrokerTest : BrokerTestBase() {
 
@@ -43,13 +42,9 @@ internal class TlsBrokerTest : BrokerTestBase() {
         val options = options(port) {
             it.copy(host = host, tls = settings, verifyHostname = verifyHostname)
         }
-        val nioHost = NioActorHost(
-            nextHostThreadName(),
-            MqttClock.Monotonic,
-            NioTransportFactory.tls(settings, verifyHostname),
-            NioActorHost.DEFAULT_READ_BUFFER
-        )
-        return trackClient(MqttClient(options, nioHost))
+        // TLS-клиент создаётся только jvm-фабрикой: она сама строит хост с `NioTransportFactory.tls(...)`
+        // (общая фабрика с чужим хостом при `tls != null` отказывает, SEVEN-227)
+        return trackClient(MqttClient(options))
     }
 
     @Test
