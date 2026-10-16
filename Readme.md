@@ -161,6 +161,7 @@ What it gives you:
 - one ordered `Flow` of incoming messages with session boundaries and real back pressure (no message is dropped);
 - orderly close that avoids a TCP reset;
 - TLS with host name verification on by default (JVM);
+- MQTT over WebSocket, `ws://` and `wss://` (JVM);
 - no blocking call on your threads: a single daemon thread `kmqtt-io-<n>` per client does all the I/O.
 
 ### Quick start
@@ -411,6 +412,44 @@ val client = MqttClient(
   the certificate are not exposed.
 - `TLSClientSettings.toString()` prints the client key and password. Never log it; `MqttClientOptions.toString()` is safe.
 
+### WebSocket (JVM)
+
+```kotlin
+val client = MqttClient(
+    MqttClientOptions(
+        host = "broker.example.org",
+        port = 8084, // the broker's WebSocket listener
+        webSocket = MqttWebSocket(
+            path = "/mqtt", // the default; Mosquitto accepts any path
+            headers = mapOf("Authorization" to "Bearer ..."), // optional extra headers of the upgrade request
+        ),
+        tls = TLSClientSettings(serverCertificate = "broker.pem"), // with tls: wss://, without: ws://
+    )
+)
+client.config.transport // MqttTransportKind.SecureWebSocket
+```
+
+- The transport is chosen by two options: `tls` and `webSocket` (`MqttClientOptions.transport` shows the result: `Tcp`,
+  `Tls`, `WebSocket` or `SecureWebSocket`). The default stays plain TCP.
+- MQTT packets travel in binary frames of the `mqtt` subprotocol (RFC 6455). The client sends one masked frame per write;
+  incoming frames may be fragmented and are streamed to the MQTT parser as they arrive, so a large frame is never
+  buffered whole. WebSocket pings are answered by the client itself and have nothing to do with MQTT keep-alive
+  (PINGREQ/PINGRESP still travel inside binary frames).
+- `wss://` uses the same `TLSClientSettings` and the same rules as plain TLS: a pinned certificate or the system trust
+  store, **host name verification on by default**, ALPN and SNI from the settings. Certificate and host name errors are
+  reported as `MqttError.Io(kind = "ssl")`.
+- Like TLS, WebSocket is available **only** through the JVM factory `MqttClient(options)`; the common factory
+  `MqttClient(options, host, clock)` throws `IllegalArgumentException` when `webSocket != null`.
+- A refused upgrade or a protocol violation of the server (a masked or text frame, reserved bits, a broken fragment
+  sequence, ...) is `MqttError.Io(kind = "websocket")`. The message shows the HTTP status code at most, never the reason
+  phrase, headers, body or the address.
+- `MqttWebSocket.toString()` and `MqttClientOptions.toString()` show neither the path (a query string may carry a
+  token) nor the header values. The client sets `Host`, `Upgrade`, `Connection` and the `Sec-WebSocket-*` headers itself;
+  they cannot be given in `headers`. The response must select the `mqtt` subprotocol or none, and no extension.
+- Closing: the client sends a WebSocket close frame after the last data (after DISCONNECT) and waits for the server's
+  close frame or end of stream (bounded by the same flush allowance of about a second) before closing the socket. A close
+  frame of the server is answered with the same code and ends the stream like a TCP FIN.
+
 ### Closing
 
 `close()` shuts the client down in an orderly way:
@@ -441,7 +480,8 @@ The broker never publishes the will after an orderly close.
 
 ### Limitations of the first version
 
-- **No WebSocket** and **no MQTT 5 enhanced authentication** (AUTH packets). Use the blocking `MQTTClient` for them.
+- **No MQTT 5 enhanced authentication** (AUTH packets). Use the blocking `MQTTClient` for it. (WebSocket was added
+  later, see [WebSocket](#websocket-jvm).)
 - **Persistent session is opt-in** (`persistentSession`, see [Persistent session](#persistent-session)); its state is kept
   in memory only. A QoS 2 publication dropped on resume (time-to-live passed, `resend = false`) may leave its packet
   identifier held by a broker that already sent PUBREC. Topic aliases are not used.
@@ -468,7 +508,8 @@ The broker never publishes the will after an orderly close.
   to the module's tests today and are not published; copy them or use a real broker.
 - For integration tests start the fork's own broker in a thread (`io.github.davidepianca98.mqtt.broker.Broker`, module
   `kmqtt-broker`) and connect to `127.0.0.1`; see `EmbeddedBrokerSupport.kt` and `MqttClientBrokerTest.kt` in
-  `kmqtt-client/src/jvmTest`. TLS tests use the same broker with `TLSSettings`.
+  `kmqtt-client/src/jvmTest`. TLS tests use the same broker with `TLSSettings`, WebSocket tests with
+  `webSocketPort` (with `TLSSettings` that port speaks `wss`), see `WebSocketBrokerTest.kt`.
 - Run the module's tests from the fork's root with `./gradlew :kmqtt-client:jvmTest` (when the fork is included in a larger
   build, the path is prefixed by the included build, for example `:kmqtt:kmqtt-client:jvmTest`).
 
@@ -482,7 +523,8 @@ The broker never publishes the will after an orderly close.
 | Subscriptions | `subscribe`/`unsubscribe` calls | declarative groups, restored after reconnect |
 | Publication result | none | `Sent`/`Delivered`/`Expired`/`Failed` |
 | Incoming | callback | ordered `Flow` with back pressure and session epochs |
-| WebSocket, enhanced auth | yes | no |
+| WebSocket | yes | yes (JVM) |
+| Enhanced auth | yes | no |
 
 ## Getting Started with the broker
 
