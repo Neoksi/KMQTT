@@ -16,8 +16,6 @@ import io.github.davidepianca98.client.core.OutgoingPublish
 import io.github.davidepianca98.client.core.PublishAdmission
 import io.github.davidepianca98.client.core.PublishRejection
 import io.github.davidepianca98.client.core.SessionSettings
-import io.github.davidepianca98.client.core.SubscriptionRequest
-import io.github.davidepianca98.mqtt.packets.Qos
 import io.github.davidepianca98.mqtt.packets.mqttv5.ReasonCode
 import kotlin.time.Duration.Companion.milliseconds
 
@@ -45,8 +43,9 @@ import kotlin.time.Duration.Companion.milliseconds
  *   DISCONNECT, ожидание EOF брокера (или дедлайна `closeLingerMs` ядра), `CloseTransport`, `State(Closed(null))`.
  *   Неотправленные публикации и ждущие PUBACK → `Failed(Closed)`. Без живой сессии — закрытие сразу.
  *
- * Подписки здесь — минимальный набор для стабильности (группы, весь набор после CONNACK, разница в живой сессии,
- * повтор); состояние фильтров, отказы по фильтрам и временные группы — S06b-T03b (`SubscriptionSet`).
+ * Подписки — [SubscriptionSet] (S06b-T03b): группы и их разница в живой сессии, весь набор после CONNACK, состояние
+ * фильтров ([EngineAction.TopicStates]), отказы SUBACK без разрыва ([EngineAction.SubscriptionRefused], H7),
+ * [EngineCommand.Resubscribe], предел [EngineOptions.maxFilters]; стабильность сессии — его счётчик SUBACK.
  */
 @MqttCoreApi
 public class MqttClientEngine(
@@ -74,9 +73,6 @@ public class MqttClientEngine(
     private var core: MqttSessionCore? = null
     private var epoch: Long? = null
     private var connectedAt: Long? = null
-    private var subscribesSent = 0
-    private var subacksOk = 0
-    private var subscriptionsConfirmed = false
     private val awaitingAck = HashMap<Int, EngineCommand.Publish>()
     private val pendingSent = ArrayList<EngineCommand.Publish>() // приняты ядром, Complete — после Write
 
@@ -84,9 +80,7 @@ public class MqttClientEngine(
     private var readPaused = false
     private var pausedSince = 0L
 
-    // Подписки (минимум T03a; T03b заменяет на SubscriptionSet): группа → фильтр → QoS; подписанное в этой сессии
-    private val groups = LinkedHashMap<String, Map<String, Qos>>()
-    private var applied: Map<String, Qos> = emptyMap()
+    private val subscriptions = SubscriptionSet(options.subscribeBatch, options.maxFilters, actions)
 
     /** Забрать накопленные действия (по порядку). */
     public fun takeActions(): List<EngineAction> {
@@ -172,7 +166,7 @@ public class MqttClientEngine(
                     actions += EngineAction.Emit(MqttIncoming.Message(output.topic, output.payload, output.qos, output.retain, it))
                 }
                 is CoreOutput.PubAck -> onPubAck(output.packetId, output.reason, nowMs)
-                is CoreOutput.SubAck -> onSubAck(output.codes)
+                is CoreOutput.SubAck -> subscriptions.onSubAck(output.packetId, output.codes)
                 is CoreOutput.UnsubAck -> Unit
                 is CoreOutput.Dropped -> actions += EngineAction.Log(EngineLogEvent.Dropped(output.reason))
                 is CoreOutput.Closed -> {
@@ -194,8 +188,7 @@ public class MqttClientEngine(
         actions += EngineAction.Emit(MqttIncoming.SessionStarted(current))
         actions += EngineAction.Log(EngineLogEvent.Connected(current))
         // Весь набор, затем ждавшие публикации (порядок MQTTConnection: resubscribeAll → drainQueue)
-        applied = desired()
-        subscribe(applied, nowMs)
+        core?.let { subscriptions.sessionStarted(it, nowMs) }
         drainQueue(nowMs)
     }
 
@@ -204,13 +197,10 @@ public class MqttClientEngine(
         core = null
         val ended = epoch
         val lived = connectedAt?.let { nowMs - it }
-        val stable = subscriptionsConfirmed || (lived != null && lived >= policy.stableAfter.inWholeMilliseconds)
+        val stable = subscriptions.confirmed || (lived != null && lived >= policy.stableAfter.inWholeMilliseconds)
         epoch = null
         connectedAt = null
-        subscribesSent = 0
-        subacksOk = 0
-        subscriptionsConfirmed = false
-        applied = emptyMap()
+        subscriptions.sessionEnded()
         val lost = if (closeRequested) PublishFailure.Closed else PublishFailure.ConnectionLost
         for (pending in pendingSent) complete(pending, PublishResult.Failed(lost))
         pendingSent.clear()
@@ -345,56 +335,16 @@ public class MqttClientEngine(
         pendingSent.clear()
     }
 
-    // ---- подписки (минимум T03a) ----
-
-    private fun desired(): Map<String, Qos> {
-        val result = LinkedHashMap<String, Qos>()
-        for (filters in groups.values) {
-            for ((filter, qos) in filters) {
-                val known = result[filter]
-                if (known == null || qos.value > known.value) result[filter] = qos
-            }
-        }
-        return result
-    }
+    // ---- подписки ----
 
     private fun setGroup(command: EngineCommand.SetGroup, nowMs: Long) {
-        if (command.filters.isEmpty()) {
-            groups.remove(command.group)
-        } else {
-            groups[command.group] = command.filters.associateWith { command.qos }
-        }
-        if (phase != Phase.Connected) return
-        val target = desired()
-        val removed = applied.keys.filter { it !in target }
-        val added = target.filter { (filter, qos) -> applied[filter] != qos }
-        applied = target
-        val current = core ?: return
-        if (removed.isNotEmpty()) removed.chunked(options.subscribeBatch).forEach { current.unsubscribe(it, nowMs) }
-        subscribe(added, nowMs)
+        subscriptions.set(command.group, command.filters, command.qos, command.refreshShared, liveCore(), nowMs)
     }
 
-    private fun resubscribe(group: String?, nowMs: Long) {
-        if (phase != Phase.Connected) return
-        val filters = if (group == null) applied else applied.filterKeys { groups[group]?.containsKey(it) == true }
-        subscribe(filters, nowMs)
-    }
+    private fun resubscribe(group: String?, nowMs: Long) = subscriptions.resubscribe(group, liveCore(), nowMs)
 
-    private fun subscribe(filters: Map<String, Qos>, nowMs: Long) {
-        val current = core ?: return
-        if (filters.isEmpty()) return
-        actions += EngineAction.Log(EngineLogEvent.Subscribe(filters.size))
-        filters.entries.chunked(options.subscribeBatch).forEach { chunk ->
-            current.subscribe(chunk.map { SubscriptionRequest(it.key, it.value) }, nowMs)
-            subscribesSent++
-        }
-    }
-
-    private fun onSubAck(codes: List<ReasonCode>) {
-        val refused = codes.count { it.value >= 0x80 }
-        if (refused == 0) subacksOk++ else actions += EngineAction.Log(EngineLogEvent.Refused(refused))
-        if (subscribesSent > 0 && subacksOk >= subscribesSent) subscriptionsConfirmed = true
-    }
+    /** Ядро живой сессии (после CONNACK, до закрытия): только ему отдаются SUBSCRIBE/UNSUBSCRIBE. */
+    private fun liveCore(): MqttSessionCore? = if (phase == Phase.Connected) core else null
 
     // ---- обратное давление ----
 

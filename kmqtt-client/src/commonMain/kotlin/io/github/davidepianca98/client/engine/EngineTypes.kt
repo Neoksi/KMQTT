@@ -7,6 +7,8 @@ import io.github.davidepianca98.client.MqttIncoming
 import io.github.davidepianca98.client.PublishResult
 import io.github.davidepianca98.client.PublishStage
 import io.github.davidepianca98.client.ReconnectPolicy
+import io.github.davidepianca98.client.SubscribeRefused
+import io.github.davidepianca98.client.TopicState
 import io.github.davidepianca98.client.core.MqttCoreApi
 import io.github.davidepianca98.client.core.SessionSettings
 import io.github.davidepianca98.mqtt.packets.Qos
@@ -28,6 +30,8 @@ public data class PublishTicket(val id: Long)
  * @param subscribeBatch фильтров в одном SUBSCRIBE (порции, `MQTTConnection.SUBSCRIBE_CHUNK`).
  * @param consumerStallLimitMs пауза чтения ([EngineCommand.SetReadPaused]) дольше — подключение закрывается с
  *   [MqttError.ConsumerStalled] (W6 §4.5); `null` — без предела.
+ * @param maxFilters различных фильтров в объединении групп; больше — [EngineCommand.SetGroup] отклоняется
+ *   ([EngineAction.GroupRejected]), группа не меняется (W6 §4.7, `MqttLimits.maxFilters`).
  */
 @MqttCoreApi
 public class EngineOptions(
@@ -39,6 +43,7 @@ public class EngineOptions(
     public val offlineCapacity: Int = 64,
     public val subscribeBatch: Int = 50,
     public val consumerStallLimitMs: Long? = 60_000,
+    public val maxFilters: Int = 4096,
 ) {
     init {
         require(port in 1..65_535) { "port out of 1..65535" }
@@ -46,11 +51,12 @@ public class EngineOptions(
         require(offlineCapacity >= 0) { "offlineCapacity < 0" }
         require(subscribeBatch >= 1) { "subscribeBatch < 1" }
         require(consumerStallLimitMs == null || consumerStallLimitMs > 0) { "consumerStallLimitMs <= 0" }
+        require(maxFilters >= 1) { "maxFilters < 1" }
     }
 
     override fun toString(): String =
         "EngineOptions(session=$session, connectTimeoutMs=$connectTimeoutMs, reconnect=$reconnect, " +
-            "offlineCapacity=$offlineCapacity, subscribeBatch=$subscribeBatch, consumerStallLimitMs=$consumerStallLimitMs)"
+            "offlineCapacity=$offlineCapacity, subscribeBatch=$subscribeBatch, consumerStallLimitMs=$consumerStallLimitMs, maxFilters=$maxFilters)"
 }
 
 /** Команда API для движка. Исполняются строго по порядку поступления (одна FIFO, H2). */
@@ -79,9 +85,18 @@ public sealed interface EngineCommand {
     /** Снять публикацию: из оффлайн-очереди — без исхода; уже записанная — исход больше не выдаётся. */
     public data class Cancel(val ticket: PublishTicket) : EngineCommand
 
-    /** Набор фильтров группы (пустой — снять группу). Желаемое = объединение групп. */
-    public class SetGroup(public val group: String, public val filters: Set<String>, public val qos: Qos) : EngineCommand {
-        override fun toString(): String = "SetGroup(filters=${filters.size}, qos=$qos)"
+    /**
+     * Набор фильтров группы (пустой — снять группу). Желаемое = объединение групп (QoS фильтра — максимум по группам).
+     * [refreshShared] — фильтры группы, уже подписанные (другой группой), подписываются ещё раз: брокер заново пришлёт
+     * их retained (`MQTTConnection.setSubscriptions(refreshShared)`).
+     */
+    public class SetGroup(
+        public val group: String,
+        public val filters: Set<String>,
+        public val qos: Qos,
+        public val refreshShared: Boolean = false,
+    ) : EngineCommand {
+        override fun toString(): String = "SetGroup(filters=${filters.size}, qos=$qos, refreshShared=$refreshShared)"
     }
 
     /** Повторный SUBSCRIBE подписанных фильтров группы [group] (`null` — всех): брокер заново пришлёт retained. */
@@ -132,6 +147,24 @@ public sealed interface EngineAction {
 
     /** Событие для `MqttLogger` (без топиков, нагрузок, адресов). */
     public data class Log(val event: EngineLogEvent) : EngineAction
+
+    /** Новое состояние всех желаемых фильтров (снимок; выдаётся при изменении). */
+    public data class TopicStates(val states: Map<String, TopicState>) : EngineAction {
+        override fun toString(): String =
+            "TopicStates(pending=${states.values.count { it == TopicState.Pending }}, " +
+                "granted=${states.values.count { it is TopicState.Granted }}, " +
+                "refused=${states.values.count { it is TopicState.Refused }})"
+    }
+
+    /** Брокер отказал в подписке на фильтр группы (H7); по событию на каждую группу, где есть фильтр. */
+    public data class SubscriptionRefused(val refusal: SubscribeRefused) : EngineAction {
+        override fun toString(): String = "SubscriptionRefused(code=${refusal.code})"
+    }
+
+    /** [EngineCommand.SetGroup] отклонён: объединение групп было бы [filters] > [limit]; группа не изменилась. */
+    public data class GroupRejected(val group: String, val filters: Int, val limit: Int) : EngineAction {
+        override fun toString(): String = "GroupRejected(filters=$filters, limit=$limit)"
+    }
 }
 
 /** События журнала движка (W6 §4.8): только числа и коды. */

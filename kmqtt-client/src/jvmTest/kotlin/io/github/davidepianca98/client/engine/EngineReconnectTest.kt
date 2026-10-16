@@ -590,18 +590,19 @@ class EngineReconnectTest {
 
     // ---- стенд ----
 
-    private enum class Suback { GRANTED, REJECTED, SILENT }
+    internal enum class Suback { GRANTED, REJECTED, SILENT }
 
-    private class Rig(
+    internal class Rig(
         val version: MQTTVersion = MQTTVersion.MQTT5,
         reconnect: ReconnectPolicy = ReconnectPolicy(random = { 0.0 }),
         offlineCapacity: Int = 64,
         val session: SessionSettings = SessionSettings(version, clientId = "c", keepAliveSec = 0),
+        maxFilters: Int = 4096,
     ) {
         var now = 0L
         private var epochs = 100L
         val engine = MqttClientEngine(
-            EngineOptions(HOST, PORT, session, reconnect = reconnect, offlineCapacity = offlineCapacity),
+            EngineOptions(HOST, PORT, session, reconnect = reconnect, offlineCapacity = offlineCapacity, maxFilters = maxFilters),
             nextEpoch = { ++epochs },
         )
         val script = BrokerScript(version)
@@ -615,6 +616,9 @@ class EngineReconnectTest {
         var connackCode = ReasonCode.SUCCESS
         var connackProps: () -> MQTT5Properties = { MQTT5Properties() }
         var suback = Suback.GRANTED
+
+        /** Код SUBACK по фильтру (T03b); `null` — по [suback]. */
+        var subackCode: ((String) -> ReasonCode)? = null
         var puback: ReasonCode? = ReasonCode.SUCCESS
         var eofOnDisconnect = true
 
@@ -758,11 +762,16 @@ class EngineReconnectTest {
                 is MQTTSubscribe -> {
                     val id = packet.packetIdentifier.toInt()
                     val n = packet.subscriptions.size
+                    val byFilter = subackCode
                     when (suback) {
-                        Suback.GRANTED -> inbound += TransportEvent.Bytes(script.suback(id, List(n) { ReasonCode.SUCCESS }))
-                        Suback.REJECTED ->
-                            inbound += TransportEvent.Bytes(script.suback(id, List(n) { ReasonCode.NOT_AUTHORIZED }))
                         Suback.SILENT -> Unit
+                        else -> if (byFilter != null) {
+                            inbound += TransportEvent.Bytes(script.suback(id, packet.subscriptions.map { byFilter(it.topicFilter) }))
+                        } else if (suback == Suback.GRANTED) {
+                            inbound += TransportEvent.Bytes(script.suback(id, List(n) { ReasonCode.SUCCESS }))
+                        } else {
+                            inbound += TransportEvent.Bytes(script.suback(id, List(n) { ReasonCode.NOT_AUTHORIZED }))
+                        }
                     }
                 }
                 is MQTTUnsubscribe -> inbound += TransportEvent.Bytes(script.unsuback(packet.packetIdentifier.toInt()))
@@ -781,7 +790,7 @@ class EngineReconnectTest {
         }
     }
 
-    private companion object {
+    internal companion object {
         const val HOST = "broker.example"
         const val PORT = 1883
         const val K1 = "/devices/wb-mr6c_1/controls/K1"
