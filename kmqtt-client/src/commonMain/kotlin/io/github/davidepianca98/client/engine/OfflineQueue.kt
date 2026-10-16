@@ -60,8 +60,11 @@ internal class OfflineQueue(private val capacity: Int) {
     /** Снять всё (закрытие клиента). */
     fun drain(): List<EngineCommand.Publish> = items.map { it.command }.also { items.clear() }
 
-    private fun deadlineOf(command: EngineCommand.Publish, nowMs: Long): Long {
-        val ttl = command.ttlMs.coerceAtLeast(0)
-        return if (ttl > Long.MAX_VALUE - nowMs) Long.MAX_VALUE else nowMs + ttl
+    companion object {
+        /** Дедлайн TTL публикации, принятой в [nowMs] (без переполнения). */
+        fun deadlineOf(command: EngineCommand.Publish, nowMs: Long): Long {
+            val ttl = command.ttlMs.coerceAtLeast(0)
+            return if (ttl > Long.MAX_VALUE - nowMs) Long.MAX_VALUE else nowMs + ttl
+        }
     }
 }

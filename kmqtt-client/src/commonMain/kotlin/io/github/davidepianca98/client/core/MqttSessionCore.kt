@@ -95,7 +95,12 @@ import io.github.davidepianca98.mqtt.packets.mqttv5.SubscriptionOptions
  *   клиента, а не брокера (QoS входящих задаёт подписка).
  * - Публикация до CONNACK не копится в ядре (`Rejected(NotConnected)`): оффлайн-очередь — в движке.
  * - packetId не пересекается с ожидающими SUBSCRIBE/UNSUBSCRIBE (старый клиент их не учитывал).
- * - Досылки неподтверждённого при `cleanStart = false` и `sessionPresent` нет: ядро живёт одно подключение.
+ * - Ядро живёт одно подключение и само ничего не досылает. Продолжение сессии (`cleanStart = false`, Session Present
+ *   = 1, SEVEN-251) ведёт движок: резервирует packetId ([reservePacketIds]), досылает PUBLISH с DUP = 1
+ *   ([resendPublish]) и PUBREL ([resendPubrel]), переносит входящие QoS 2 ([incomingQos2] → [restoreIncomingQos2]).
+ *   При `cleanStart = false` неизвестный PUBREL получает PUBCOMP (MQTT 5 — `PACKET_IDENTIFIER_NOT_FOUND`) без разрыва;
+ *   при `cleanStart = true` это по-прежнему ошибка протокола.
+ * - MQTT 5: при [SessionSettings.sessionExpiryIntervalSec] ≠ null в CONNECT уходит Session Expiry Interval.
  */
 @MqttCoreApi
 public class MqttSessionCore(private val settings: SessionSettings, nowMs: Long) {
@@ -130,6 +135,7 @@ public class MqttSessionCore(private val settings: SessionSettings, nowMs: Long)
     private val pendingPubcomp = HashSet<Int>() // исходящие QoS 2, ждут PUBCOMP
     private val pendingSubscriptions = HashSet<Int>() // SUBSCRIBE/UNSUBSCRIBE, ждут SUBACK/UNSUBACK
     private val qos2Received = HashSet<Int>() // входящие QoS 2, ждут PUBREL
+    private val reserved = HashSet<Int>() // packetId публикаций прошлого подключения, ждущих досылки (SEVEN-251)
     private val topicAliases = HashMap<Int, String>()
     private var aliasesLost = false
 
@@ -192,21 +198,96 @@ public class MqttSessionCore(private val settings: SessionSettings, nowMs: Long)
             return PublishAdmission.FlowControlled
         }
         val packetId = if (p.qos != Qos.AT_MOST_ONCE) nextPacketId() else null
-        val id = packetId?.toUInt()
-        val payload = p.payload.asUByteArray()
-        // timestamp передаётся явно: значение по умолчанию у kmqtt-common читает системные часы
-        val packet = if (mqtt5) {
-            MQTT5Publish(p.retain, p.qos, false, p.topic, id, MQTT5Properties(), payload, nowMs)
-        } else {
-            MQTT4Publish(p.retain, p.qos, false, p.topic, id, payload, nowMs)
-        }
-        val data = packet.toByteArray().asByteArray()
+        val data = publishBytes(p, packetId, dup = false, nowMs)
         if (data.size > serverMaximumPacketSize) {
             return PublishAdmission.Rejected(PublishRejection.TooLarge(data.size, serverMaximumPacketSize))
         }
         if (packetId != null) pendingAck[packetId] = p.qos
         enqueue(data, nowMs)
         return PublishAdmission.Accepted(packetId)
+    }
+
+    /**
+     * Досылка неподтверждённой публикации прошлого подключения той же сессии (SEVEN-251, `cleanStart = false` и
+     * Session Present = 1 в CONNACK): PUBLISH с DUP = 1 и прежним [packetId] (MQTT 3.1.1 §4.4, MQTT 5 §4.4). Только
+     * в `Connected` и только QoS ≥ 1; [packetId] не должен быть занят (резерв [reservePacketIds] снимается). Проверки —
+     * как у [publish] (QoS, retain, размер, окно Receive Maximum брокера → [PublishAdmission.FlowControlled]).
+     * Решение «досылать ли» (TTL, признак «не досылать») — у движка.
+     */
+    public fun resendPublish(p: OutgoingPublish, packetId: Int, nowMs: Long): PublishAdmission {
+        require(p.qos != Qos.AT_MOST_ONCE) { "QoS 0 is never re-sent" }
+        require(packetId in 1..MAX_PACKET_ID) { "packetId out of 1..65535" }
+        if (state != CoreState.Connected) return PublishAdmission.Rejected(PublishRejection.NotConnected)
+        check(packetId !in pendingAck && packetId !in pendingPubcomp && packetId !in pendingSubscriptions) {
+            "packetId in use"
+        }
+        if (!isValidTopic(p.topic)) return PublishAdmission.Rejected(PublishRejection.InvalidTopic)
+        if (p.qos.value > serverMaximumQos.value) return PublishAdmission.Rejected(PublishRejection.QosNotSupported)
+        if (p.retain && !serverRetainAvailable) return PublishAdmission.Rejected(PublishRejection.RetainNotSupported)
+        if (pendingAck.size + pendingPubcomp.size >= serverReceiveMaximum) return PublishAdmission.FlowControlled
+        val data = publishBytes(p, packetId, dup = true, nowMs)
+        if (data.size > serverMaximumPacketSize) {
+            return PublishAdmission.Rejected(PublishRejection.TooLarge(data.size, serverMaximumPacketSize))
+        }
+        reserved -= packetId
+        pendingAck[packetId] = p.qos
+        enqueue(data, nowMs)
+        return PublishAdmission.Accepted(packetId)
+    }
+
+    /**
+     * Досылка PUBREL исходящей QoS 2, на которую в прошлом подключении той же сессии пришёл PUBREC (SEVEN-251): ответ
+     * — [CoreOutput.PubAck] по PUBCOMP. Только в `Connected`; [packetId] не должен быть занят (резерв снимается).
+     */
+    public fun resendPubrel(packetId: Int, nowMs: Long) {
+        check(state == CoreState.Connected) { "resendPubrel() in state $state" }
+        check(packetId !in pendingAck && packetId !in pendingPubcomp && packetId !in pendingSubscriptions) {
+            "packetId in use"
+        }
+        reserved -= packetId
+        pendingPubcomp += packetId
+        val pubrel = if (mqtt5) MQTT5Pubrel(packetId.toUInt()) else MQTT4Pubrel(packetId.toUInt())
+        enqueue(pubrel.toByteArray().asByteArray(), nowMs)
+    }
+
+    /**
+     * Зарезервировать packetId неподтверждённых публикаций прошлого подключения, которые ждут досылки (SEVEN-251):
+     * новые PUBLISH/SUBSCRIBE/UNSUBSCRIBE их не берут, пока движок не дошлёт ([resendPublish], [resendPubrel]) или не
+     * откажется от досылки ([releasePacketId]).
+     */
+    public fun reservePacketIds(ids: Collection<Int>) {
+        reserved += ids
+    }
+
+    /** Снять резерв [reservePacketIds] с [packetId]: публикация не будет дослана. */
+    public fun releasePacketId(packetId: Int) {
+        reserved -= packetId
+    }
+
+    /** packetId исходящих QoS 2, на которые пришёл PUBREC и ждётся PUBCOMP (снимок для досылки PUBREL). */
+    public fun awaitingPubcomp(): Set<Int> = HashSet(pendingPubcomp)
+
+    /**
+     * packetId входящих QoS 2, на которые отправлен PUBREC и ждётся PUBREL (снимок): в следующем подключении той же
+     * сессии повтор PUBLISH с этим id не выдаётся второй раз ([restoreIncomingQos2]).
+     */
+    public fun incomingQos2(): Set<Int> = HashSet(qos2Received)
+
+    /** Продолжить состояние входящих QoS 2 прошлого подключения той же сессии (Session Present = 1). */
+    public fun restoreIncomingQos2(ids: Collection<Int>) {
+        qos2Received += ids
+    }
+
+    private fun publishBytes(p: OutgoingPublish, packetId: Int?, dup: Boolean, nowMs: Long): ByteArray {
+        val id = packetId?.toUInt()
+        val payload = p.payload.asUByteArray()
+        // timestamp передаётся явно: значение по умолчанию у kmqtt-common читает системные часы
+        val packet = if (mqtt5) {
+            MQTT5Publish(p.retain, p.qos, dup, p.topic, id, MQTT5Properties(), payload, nowMs)
+        } else {
+            MQTT4Publish(p.retain, p.qos, dup, p.topic, id, payload, nowMs)
+        }
+        return packet.toByteArray().asByteArray()
     }
 
     /**
@@ -376,11 +457,22 @@ public class MqttSessionCore(private val settings: SessionSettings, nowMs: Long)
                 }
             }
             is MQTTPubrel -> {
+                val known = qos2Received.remove(packet.packetId.toInt())
+                if (!known && !settings.cleanStart) {
+                    // Сессия продолжается (SEVEN-251): брокер досылает PUBREL, состояние которого клиент не сохранил
+                    // (например, новый экземпляр клиента с тем же clientId) — завершить поток, а не рвать подключение:
+                    // ошибка повторялась бы на каждом переподключении
+                    val pubcomp = if (mqtt5) {
+                        MQTT5Pubcomp(packet.packetId, ReasonCode.PACKET_IDENTIFIER_NOT_FOUND)
+                    } else {
+                        MQTT4Pubcomp(packet.packetId)
+                    }
+                    enqueue(pubcomp.toByteArray().asByteArray(), nowMs)
+                    return
+                }
                 val pubcomp = if (mqtt5) MQTT5Pubcomp(packet.packetId) else MQTT4Pubcomp(packet.packetId)
                 enqueue(pubcomp.toByteArray().asByteArray(), nowMs)
-                if (!qos2Received.remove(packet.packetId.toInt())) {
-                    throw MQTTException(ReasonCode.PACKET_IDENTIFIER_NOT_FOUND)
-                }
+                if (!known) throw MQTTException(ReasonCode.PACKET_IDENTIFIER_NOT_FOUND)
             }
             is MQTTPubcomp -> {
                 val id = packet.packetId.toInt()
@@ -554,6 +646,7 @@ public class MqttSessionCore(private val settings: SessionSettings, nowMs: Long)
         val clientId = settings.clientId ?: generateRandomClientId()
         val packet = if (mqtt5) {
             val properties = MQTT5Properties(
+                sessionExpiryInterval = settings.sessionExpiryIntervalSec?.toUInt(),
                 maximumPacketSize = settings.maxIncomingPacket.toUInt(),
                 receiveMaximum = settings.receiveMaximum.takeIf { it != 65_535 }?.toUInt(),
                 topicAliasMaximum = settings.topicAliasMaximum.takeIf { it > 0 }?.toUInt(),
@@ -600,7 +693,7 @@ public class MqttSessionCore(private val settings: SessionSettings, nowMs: Long)
         repeat(MAX_PACKET_ID) {
             lastPacketId = lastPacketId % MAX_PACKET_ID + 1
             val id = lastPacketId
-            if (id !in pendingAck && id !in pendingPubcomp && id !in pendingSubscriptions) return id
+            if (id !in pendingAck && id !in pendingPubcomp && id !in pendingSubscriptions && id !in reserved) return id
         }
         throw IllegalStateException("no free packet identifier")
     }

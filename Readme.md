@@ -237,7 +237,7 @@ returns exactly one result per call:
 | `Sent(epoch)` | The PUBLISH was handed to the transport of a live session. The I/O thread does not confirm that the operating system took every byte, and the broker has confirmed nothing yet. |
 | `Delivered(epoch)` | The broker acknowledged it: PUBACK for QoS 1, PUBCOMP for QoS 2. Only with `until = PublishStage.Delivered`. QoS 0 has no acknowledgement and ends as `Sent`. |
 | `Expired` | There was no live session within `ttl`; the message was never sent. |
-| `Failed(reason)` | `ConnectionLost` (written, but the connection broke before the acknowledgement), `Closed`, `Rejected(code)` (refused by the client against what the broker announced in CONNACK, or by the broker with an MQTT 5 PUBACK code of 0x80 or more), `QueueFull`. |
+| `Failed(reason)` | `ConnectionLost` (written, but the connection broke before the acknowledgement), `SessionLost` (persistent session only: written in an earlier connection, and the broker no longer has the session), `Closed`, `Rejected(code)` (refused by the client against what the broker announced in CONNACK, or by the broker with an MQTT 5 PUBACK code of 0x80 or more), `QueueFull`. |
 
 Details worth knowing:
 
@@ -246,13 +246,42 @@ Details worth knowing:
   Anything that expired is never sent afterwards, which is the point: do not turn a light on ten minutes late.
 - `QueueFull` comes from the offline queue (`OfflineQueue.capacity`) or, at once and without blocking, when
   `MqttLimits.commandQueue` publications (1024) are already waiting for the I/O thread to take them.
-- Every session uses a clean start. A publication written but not acknowledged when the connection breaks is not re-sent
-  after reconnecting; with `until = Delivered` you get `Failed(ConnectionLost)` and decide yourself whether to retry.
+- By default every session uses a clean start. A publication written but not acknowledged when the connection breaks is
+  not re-sent after reconnecting; with `until = Delivered` you get `Failed(ConnectionLost)` and decide yourself whether
+  to retry. With `persistentSession = true` it is re-sent instead, see [Persistent session](#persistent-session).
 - With MQTT 3.1.1 there is no failure code in PUBACK, so `Delivered` does not prove that the broker's access control let
   the publication through.
 - Cancelling the calling coroutine before the packet was written removes the publication from the queue; after the write
   it only stops waiting.
 - The payload array is not copied; do not modify it after the call.
+
+### Persistent session
+
+Off by default. `MqttClientOptions(persistentSession = true, clientId = "...", sessionExpiry = 10.minutes)` connects with
+Clean Start = 0 (Clean Session = 0 in MQTT 3.1.1) and resumes the broker session after a reconnect:
+
+- The client keeps every unacknowledged QoS 1 and QoS 2 publication (packet identifier, payload, time-to-live) across
+  reconnects, at most `MqttLimits.maxUnacknowledged` (64); beyond that new QoS 1/2 publications wait in the offline queue.
+- CONNACK with **Session Present = 1**: they are re-sent with the DUP flag and their original packet identifiers (QoS 2
+  after PUBREC: PUBREL), in the original order and before anything published later. A waiting `until = Delivered` call
+  then completes with `Delivered` as usual; one that already got `Sent` is re-sent silently.
+- The time-to-live still rules: it is counted from the `publish` call, and a publication whose `ttl` passed before the
+  resend is not re-sent (`Expired` while offline). A command is never executed late just because the session survived.
+- CONNACK with **Session Present = 0** (session expired, broker restarted): they fail with `Failed(SessionLost)`, nothing is
+  re-sent.
+- `publish(..., resend = false)` marks a publication that must never be written twice, for example a dangerous command
+  that needed a confirmation: if the connection breaks before the acknowledgement it fails with `ConnectionLost` at once,
+  exactly as with a clean session.
+- Rule of thumb: a publication that has received `Failed` or `Expired` is never written again; cancelling the calling
+  coroutine also drops it.
+- `clientId` is required (the broker finds the session by it). `sessionExpiry` (MQTT 5 Session Expiry Interval, at least
+  1 s, `Duration.INFINITE` = never) is how long the broker keeps the session; MQTT 3.1.1 has no such field and the broker
+  decides.
+- Subscriptions are still subscribed again after every CONNACK; filters removed while offline are unsubscribed on resume.
+  While offline the broker may queue QoS 1/2 messages of the session's subscriptions and deliver them after the reconnect.
+- The state lives in the memory of the client instance: a new `MqttClient` or a restarted process starts without it (the
+  broker may still report Session Present = 1, then there is simply nothing to re-send).
+- QoS 1 is "at least once": a re-sent publication may reach subscribers twice when the first copy had arrived.
 
 ### Subscriptions
 
@@ -413,8 +442,9 @@ The broker never publishes the will after an orderly close.
 ### Limitations of the first version
 
 - **No WebSocket** and **no MQTT 5 enhanced authentication** (AUTH packets). Use the blocking `MQTTClient` for them.
-- **Always a clean session.** There is no `cleanStart` option and no persistent-session resumption: unacknowledged
-  publications are not re-sent, subscriptions are re-established by the client. Topic aliases are not used.
+- **Persistent session is opt-in** (`persistentSession`, see [Persistent session](#persistent-session)); its state is kept
+  in memory only. A QoS 2 publication dropped on resume (time-to-live passed, `resend = false`) may leave its packet
+  identifier held by a broker that already sent PUBREC. Topic aliases are not used.
 - **QoS 2** (publishing and receiving) is implemented on the main path only and has no dedicated tests; the API and the
   tests concentrate on QoS 0 and 1.
 - **I/O host on the JVM only.** There is no host for JavaScript or native targets. A custom host implements `MqttHost`

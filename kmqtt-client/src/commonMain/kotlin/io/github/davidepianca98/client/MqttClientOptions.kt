@@ -6,6 +6,7 @@ import io.github.davidepianca98.mqtt.packets.Qos
 import io.github.davidepianca98.mqtt.packets.mqttv5.ReasonCode
 import io.github.davidepianca98.socket.tls.TLSClientSettings
 import kotlin.time.Duration
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
 // Configuration of the coroutine client. Security: no toString() in this file prints the broker address, the login,
@@ -65,6 +66,21 @@ import kotlin.time.Duration.Companion.seconds
  * @param offlineQueue limits of the queue of publications waiting for a connection.
  * @param limits memory limits.
  * @param logger sink for diagnostic events without topics or payloads.
+ * @param persistentSession resume the broker session after a reconnect (**off by default**). Off: every connection
+ *   uses a clean start (Clean Session in MQTT 3.1.1); a publication written but not acknowledged when the connection
+ *   breaks is never re-sent. On: CONNECT goes with Clean Start = 0, and the client keeps unacknowledged QoS 1 and QoS 2
+ *   publications (with their packet identifiers and time-to-live, at most [MqttLimits.maxUnacknowledged]) across
+ *   reconnects. When the broker answers with Session Present = 1 they are re-sent with the DUP flag, in the original
+ *   order and before any newer publication, unless their time-to-live has passed ([PublishResult.Expired]) or they
+ *   were published with `resend = false` (see [MqttClient.publish]). When the broker has lost the session (Session
+ *   Present = 0) they fail with [PublishFailure.SessionLost] and nothing is re-sent. Requires an explicit [clientId]
+ *   (the broker finds the session by it). The state lives in the memory of this client instance only: a new client or
+ *   a restarted process does not inherit it. QoS 0 publications are never re-sent. While the client is offline the
+ *   broker may queue QoS 1 and 2 messages for the subscriptions of the session and deliver them after the reconnect.
+ * @param sessionExpiry MQTT 5 Session Expiry Interval sent in CONNECT when [persistentSession] is on: how long the
+ *   broker keeps the session after the connection is lost, at least 1 second ([Duration.INFINITE]: never expires;
+ *   values above 4294967295 seconds are sent as "never"). Not used with MQTT 3.1.1, where the broker decides how long
+ *   it keeps a session, nor without [persistentSession].
  */
 public data class MqttClientOptions(
     val host: String,
@@ -83,6 +99,8 @@ public data class MqttClientOptions(
     val offlineQueue: OfflineQueue = OfflineQueue(),
     val limits: MqttLimits = MqttLimits(),
     val logger: MqttLogger = MqttLogger.None,
+    val persistentSession: Boolean = false,
+    val sessionExpiry: Duration = 10.minutes,
 ) {
     init {
         require(host.isNotBlank()) { "host is blank" }
@@ -93,13 +111,17 @@ public data class MqttClientOptions(
         require(connectTimeout.isPositive()) { "connectTimeout <= 0" }
         require(connackTimeout.isPositive()) { "connackTimeout <= 0" }
         require(!closeLinger.isNegative()) { "closeLinger < 0" }
+        require(!persistentSession || !clientId.isNullOrBlank()) { "persistentSession needs an explicit clientId" }
+        require(!persistentSession || sessionExpiry >= 1.seconds) { "sessionExpiry < 1 s with persistentSession" }
+        require(!sessionExpiry.isNegative()) { "sessionExpiry < 0" }
     }
 
     override fun toString(): String =
         "MqttClientOptions(version=$version, credentials=$credentials, tls=${if (tls == null) "off" else "on"}, " +
             "verifyHostname=$verifyHostname, clientId=${if (clientId == null) "random" else "set"}, keepAlive=$keepAlive, " +
             "connectTimeout=$connectTimeout, connackTimeout=$connackTimeout, closeLinger=$closeLinger, will=$will, " +
-            "reconnect=$reconnect, offlineQueue=$offlineQueue, limits=$limits)"
+            "reconnect=$reconnect, offlineQueue=$offlineQueue, limits=$limits, persistentSession=$persistentSession, " +
+            "sessionExpiry=$sessionExpiry)"
 }
 
 /**
@@ -186,6 +208,10 @@ public data class OfflineQueue(val ttl: Duration = 10.seconds, val capacity: Int
  *   this only happens when the I/O thread falls behind, because every caller of `publish` waits for its outcome. Other
  *   requests (subscription changes, cancellation, close) are not limited and never dropped: each of them is bounded by
  *   the caller (one request per call, the set of filters by [maxFilters]).
+ * @param maxUnacknowledged only with [MqttClientOptions.persistentSession]: how many unacknowledged QoS 1 and 2
+ *   publications (payload included) the client keeps for re-sending, in a live session and between connections. When
+ *   the limit is reached the next QoS 1 or 2 publication waits in the offline queue, as with a full receive window of
+ *   the broker (its time-to-live keeps running). Without a persistent session the limit does not apply.
  */
 public data class MqttLimits(
     val maxIncomingPacket: Int = 256 * 1024,
@@ -195,6 +221,7 @@ public data class MqttLimits(
     val subscribeBatch: Int = 50,
     val maxFilters: Int = 4096,
     val commandQueue: Int = 1024,
+    val maxUnacknowledged: Int = 64,
 ) {
     init {
         require(maxIncomingPacket >= 2) { "maxIncomingPacket < 2" }
@@ -204,6 +231,7 @@ public data class MqttLimits(
         require(subscribeBatch >= 1) { "subscribeBatch < 1" }
         require(maxFilters >= 1) { "maxFilters < 1" }
         require(commandQueue >= 1) { "commandQueue < 1" }
+        require(maxUnacknowledged >= 1) { "maxUnacknowledged < 1" }
     }
 }
 
@@ -234,6 +262,12 @@ public interface MqttLogger {
 
     /** A PUBACK of MQTT 5 carried the failure code [code]. */
     public fun publishRefused(code: ReasonCode) {}
+
+    /**
+     * A resumed persistent session ([MqttClientOptions.persistentSession]) re-sent [count] unacknowledged publications
+     * (PUBLISH with the DUP flag, or PUBREL for QoS 2).
+     */
+    public fun resent(count: Int) {}
 
     /** [MqttSubscriptions.set] was refused: the groups would hold [filters] distinct filters with a limit of [limit]. */
     public fun groupRejected(filters: Int, limit: Int) {}

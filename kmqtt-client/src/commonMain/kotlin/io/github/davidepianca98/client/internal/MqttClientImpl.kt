@@ -150,11 +150,12 @@ internal class MqttClientImpl(
         retain: Boolean,
         ttl: Duration,
         until: PublishStage,
+        resend: Boolean,
     ): PublishResult {
         val ticket = PublishTicket(tickets.incrementAndGet())
         val ttlMs = ttl.inWholeMilliseconds.coerceAtLeast(0)
         val result = CompletableDeferred<PublishResult>()
-        val command = EngineCommand.Publish(ticket, topic, payload, qos, retain, ttlMs, until)
+        val command = EngineCommand.Publish(ticket, topic, payload, qos, retain, ttlMs, until, resend)
         submitOrRefuse(ClientRequest.Publish(command, result))?.let { return PublishResult.Failed(it) }
         try {
             return result.await()
@@ -379,6 +380,7 @@ internal class MqttClientImpl(
             is EngineLogEvent.Subscribe -> subscribe(event.count)
             is EngineLogEvent.Refused -> refused(event.count)
             is EngineLogEvent.PublishRefused -> publishRefused(event.code)
+            is EngineLogEvent.Resent -> resent(event.count)
         }
     }
 

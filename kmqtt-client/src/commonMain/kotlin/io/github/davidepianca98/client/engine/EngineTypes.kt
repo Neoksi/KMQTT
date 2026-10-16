@@ -32,6 +32,10 @@ public data class PublishTicket(val id: Long)
  *   [MqttError.ConsumerStalled] (W6 §4.5); `null` — без предела.
  * @param maxFilters различных фильтров в объединении групп; больше — [EngineCommand.SetGroup] отклоняется
  *   ([EngineAction.GroupRejected]), группа не меняется (W6 §4.7, `MqttLimits.maxFilters`).
+ * @param maxUnacknowledged только при `session.cleanStart = false` (SEVEN-251): сколько неподтверждённых исходящих
+ *   QoS ≥ 1 движок хранит для досылки (с нагрузкой) — в живой сессии и между подключениями. При пределе следующая
+ *   публикация QoS ≥ 1 ждёт в оффлайн-очереди (как при занятом окне Receive Maximum брокера), TTL идёт. При
+ *   `cleanStart = true` не действует.
  */
 @MqttCoreApi
 public class EngineOptions(
@@ -44,8 +48,10 @@ public class EngineOptions(
     public val subscribeBatch: Int = 50,
     public val consumerStallLimitMs: Long? = 60_000,
     public val maxFilters: Int = 4096,
+    public val maxUnacknowledged: Int = 64,
 ) {
     init {
+        require(maxUnacknowledged >= 1) { "maxUnacknowledged < 1" }
         require(port in 1..65_535) { "port out of 1..65535" }
         require(connectTimeoutMs > 0) { "connectTimeoutMs <= 0" }
         require(offlineCapacity >= 0) { "offlineCapacity < 0" }
@@ -56,7 +62,8 @@ public class EngineOptions(
 
     override fun toString(): String =
         "EngineOptions(session=$session, connectTimeoutMs=$connectTimeoutMs, reconnect=$reconnect, " +
-            "offlineCapacity=$offlineCapacity, subscribeBatch=$subscribeBatch, consumerStallLimitMs=$consumerStallLimitMs, maxFilters=$maxFilters)"
+            "offlineCapacity=$offlineCapacity, subscribeBatch=$subscribeBatch, consumerStallLimitMs=$consumerStallLimitMs, " +
+            "maxFilters=$maxFilters, maxUnacknowledged=$maxUnacknowledged)"
 }
 
 /** Команда API для движка. Исполняются строго по порядку поступления (одна FIFO, H2). */
@@ -68,6 +75,11 @@ public sealed interface EngineCommand {
     /**
      * Публикация. Без живой сессии ждёт в оффлайн-очереди не дольше [ttlMs] (затем `Expired`). Исход —
      * [EngineAction.Complete] с [ticket], ровно один (кроме снятой [Cancel]).
+     *
+     * [resend] (SEVEN-251) — можно ли дослать уже записанный, но не подтверждённый PUBLISH после переподключения в
+     * продолжающейся сессии (`cleanStart = false`, Session Present = 1). `false` — никогда: при обрыве до PUBACK исход
+     * как при чистой сессии (`Failed(ConnectionLost)`, если ждут `Delivered`). Первую отправку из оффлайн-очереди
+     * признак не меняет (её ограничивает TTL); при `cleanStart = true` не действует.
      */
     public class Publish(
         public val ticket: PublishTicket,
@@ -77,9 +89,11 @@ public sealed interface EngineCommand {
         public val retain: Boolean,
         public val ttlMs: Long,
         public val until: PublishStage,
+        public val resend: Boolean = true,
     ) : EngineCommand {
         override fun toString(): String =
-            "Publish(ticket=${ticket.id}, qos=$qos, retain=$retain, size=${payload.size}, ttlMs=$ttlMs, until=$until)"
+            "Publish(ticket=${ticket.id}, qos=$qos, retain=$retain, size=${payload.size}, ttlMs=$ttlMs, until=$until, " +
+                "resend=$resend)"
     }
 
     /** Снять публикацию: из оффлайн-очереди — без исхода; уже записанная — исход больше не выдаётся. */
@@ -188,4 +202,7 @@ public sealed interface EngineLogEvent {
 
     /** PUBACK MQTT 5 с отказом. */
     public data class PublishRefused(val code: ReasonCode) : EngineLogEvent
+
+    /** Продолжение сессии (SEVEN-251): дослано [count] неподтверждённых публикаций (PUBLISH с DUP = 1 или PUBREL). */
+    public data class Resent(val count: Int) : EngineLogEvent
 }

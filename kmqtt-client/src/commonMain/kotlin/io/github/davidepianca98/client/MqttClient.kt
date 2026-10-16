@@ -27,8 +27,10 @@ import kotlin.time.Duration
  * single-use: it cannot be restarted after [close]. A client that closed itself (reconnection attempts exhausted, see
  * [ReconnectPolicy.maxAttempts]) still holds its I/O thread until [close] is called, so always call [close].
  *
- * Every session uses a clean start: unacknowledged publications and subscriptions of a broken connection are never
- * resumed by the broker; subscriptions are re-established by the client after each reconnect.
+ * By default every session uses a clean start: unacknowledged publications and subscriptions of a broken connection
+ * are never resumed by the broker; subscriptions are re-established by the client after each reconnect. With
+ * [MqttClientOptions.persistentSession] the broker session is resumed and unacknowledged QoS 1 and 2 publications are
+ * re-sent (see there); subscriptions are still re-established after each reconnect.
  */
 public interface MqttClient {
     /** The options this client was created with. */
@@ -90,7 +92,11 @@ public interface MqttClient {
      * Without a live session, or while the broker's receive window is full, the publication waits in the offline queue
      * ([MqttClientOptions.offlineQueue]) for at most [ttl]. The queue is FIFO and keeps the order of calls. A
      * publication that was written but not acknowledged when the connection broke is not re-sent after reconnecting
-     * (the new session is clean): it fails with [PublishFailure.ConnectionLost] if `until = Delivered`. If
+     * (the new session is clean): it fails with [PublishFailure.ConnectionLost] if `until = Delivered`. With
+     * [MqttClientOptions.persistentSession] it is kept instead and re-sent with the DUP flag when the broker resumes the
+     * session, but only while [ttl] (counted from this call) has not passed and only if [resend] is `true`; otherwise
+     * the outcome is [PublishResult.Expired], [PublishFailure.SessionLost] or [PublishFailure.ConnectionLost]. A
+     * publication that has received any `Failed` or `Expired` outcome is never written again. If
      * [MqttLimits.commandQueue] publications are already waiting for the I/O thread to take them, the call fails at once
      * with [PublishFailure.QueueFull] instead of queueing (this happens only when the I/O thread falls behind).
      *
@@ -104,6 +110,13 @@ public interface MqttClient {
      * @param retain the retain flag.
      * @param ttl how long the publication may wait for a live session before it expires.
      * @param until the stage to wait for.
+     * @param resend whether this publication may be re-sent after a reconnect when it was written but not
+     *   acknowledged (only with [MqttClientOptions.persistentSession]; without it nothing is ever re-sent). Pass `false`
+     *   for a command with a side effect that must never be executed twice or late, for example a dangerous control
+     *   that needs a confirmation: if the connection breaks before the acknowledgement, the outcome is
+     *   [PublishFailure.ConnectionLost] (with `until = Delivered`) exactly as with a clean session, and the packet is
+     *   never written again. It does not affect the first send of a publication waiting in the offline queue, which is
+     *   limited by [ttl] only.
      */
     public suspend fun publish(
         topic: String,
@@ -112,6 +125,7 @@ public interface MqttClient {
         retain: Boolean = false,
         ttl: Duration = config.offlineQueue.ttl,
         until: PublishStage = PublishStage.Sent,
+        resend: Boolean = true,
     ): PublishResult
 
     /**

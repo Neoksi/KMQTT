@@ -92,7 +92,13 @@ internal class TcpProxy(private val targetHost: String, private val targetPort: 
             while (true) {
                 val read = from.read(buffer)
                 if (read < 0) break
-                while (held() && !client.isClosed) Thread.sleep(5)
+                var waited = false
+                while (held() && !client.isClosed) {
+                    waited = true
+                    Thread.sleep(5)
+                }
+                // Задержанные байты не доходят до адресата, если соединение оборвано, пока они ждали (cut)
+                if (waited && client.isClosed) break
                 to.write(buffer, 0, read)
                 to.flush()
                 tap?.invoke(buffer.copyOf(read))
@@ -135,7 +141,8 @@ internal sealed interface ClientPacket {
         val login: String?,
         val password: String?,
         val protocolLevel: Int,
-        override val atMs: Long
+        override val atMs: Long,
+        val cleanStart: Boolean = true,
     ) : ClientPacket
 
     data class Subscribe(val filters: List<String>, override val atMs: Long) : ClientPacket
@@ -147,7 +154,9 @@ internal sealed interface ClientPacket {
         val payload: String,
         val qos: Int,
         val retain: Boolean,
-        override val atMs: Long
+        override val atMs: Long,
+        val dup: Boolean = false,
+        val packetId: Int? = null,
     ) : ClientPacket
 
     data class Disconnect(override val atMs: Long) : ClientPacket
@@ -230,15 +239,16 @@ internal class ProxiedConnection(val number: Int) {
                 }
                 val login = if (flags and USER_FLAG != 0) reader.string() else null
                 val password = if (flags and PASSWORD_FLAG != 0) String(reader.binary()) else null
-                packets += ClientPacket.Connect(clientId, login, password, protocolLevel, now)
+                packets += ClientPacket.Connect(clientId, login, password, protocolLevel, now, flags and CLEAN_START != 0)
             }
 
             TYPE_PUBLISH -> {
                 val qos = (header shr 1) and 3
                 val topic = reader.string()
-                if (qos > 0) reader.u16()
+                val packetId = if (qos > 0) reader.u16() else null
                 if (protocolLevel == 5) reader.skipProperties()
-                packets += ClientPacket.Publish(topic, String(reader.rest()), qos, header and 1 != 0, now)
+                val dup = header and DUP_FLAG != 0
+                packets += ClientPacket.Publish(topic, String(reader.rest()), qos, header and 1 != 0, now, dup, packetId)
             }
 
             TYPE_SUBSCRIBE, TYPE_UNSUBSCRIBE -> {
@@ -304,5 +314,7 @@ internal class ProxiedConnection(val number: Int) {
         const val USER_FLAG = 0x80
         const val PASSWORD_FLAG = 0x40
         const val WILL_FLAG = 0x04
+        const val CLEAN_START = 0x02
+        const val DUP_FLAG = 0x08
     }
 }

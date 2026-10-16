@@ -21,8 +21,11 @@ public sealed interface ConnectionState {
      * The session is established (CONNACK with success).
      *
      * @param epoch session number; it grows over the whole process, so a newer session always has a larger epoch.
-     * @param sessionPresent the Session Present flag from CONNACK. The client always connects with a clean start
-     *   (Clean Session in MQTT 3.1.1), so a compliant broker sends `false` here.
+     * @param sessionPresent the Session Present flag from CONNACK. Without
+     *   [MqttClientOptions.persistentSession] the client connects with a clean start (Clean Session in MQTT 3.1.1), so a
+     *   compliant broker sends `false` here. With it, `true` means the broker resumed the session and the client re-sends
+     *   its unacknowledged publications; `false` means the session was lost (they fail with
+     *   [PublishFailure.SessionLost]).
      * @param server properties announced by the broker.
      */
     public data class Connected(val epoch: Long, val sessionPresent: Boolean, val server: ServerInfo) : ConnectionState
@@ -121,7 +124,12 @@ public sealed interface PublishResult {
     /** The broker acknowledged the publication in the session [epoch] (PUBACK, or PUBCOMP for QoS 2). */
     public data class Delivered(val epoch: Long) : PublishResult
 
-    /** No live session appeared within the time-to-live; the publication was never sent to the broker. */
+    /**
+     * No live session appeared within the time-to-live, so the publication was not sent (again). Usually it was never
+     * sent to the broker. With [MqttClientOptions.persistentSession] it may also be a publication that was written in an
+     * earlier connection, was not acknowledged when that connection broke, and whose time-to-live passed before it could
+     * be re-sent: whether the broker received that first copy is unknown.
+     */
     public data object Expired : PublishResult
 
     /** The publication did not complete for the given [reason]. */
@@ -133,9 +141,17 @@ public sealed interface PublishFailure {
     /**
      * The packet was written but the connection broke before it was acknowledged (only with
      * `until = PublishStage.Delivered`). It is not re-sent after reconnecting; whether the broker received it is
-     * unknown.
+     * unknown. With [MqttClientOptions.persistentSession] this happens at once only for a publication with
+     * `resend = false`, or when the reconnection attempts are exhausted; others wait for the next session instead.
      */
     public data object ConnectionLost : PublishFailure
+
+    /**
+     * Only with [MqttClientOptions.persistentSession]: the packet was written in an earlier connection and not
+     * acknowledged, and the broker no longer has the session (CONNACK with Session Present = 0, for example after the
+     * session expired or the broker restarted). It is not re-sent; whether the broker received it is unknown.
+     */
+    public data object SessionLost : PublishFailure
 
     /** The client was closed before the publication was sent, or before it was acknowledged. */
     public data object Closed : PublishFailure

@@ -26,13 +26,20 @@ import io.github.davidepianca98.mqtt.packets.mqttv5.ReasonCode
  * - Группа добавляет фильтр, которому в этой сессии уже отказано (другой группой), — SUBSCRIBE не уходит, а отказ
  *   сразу выдаётся и этой группе (временная группа обнаружения узнаёт отказ без ожидания окна).
  * - Стабильность сессии: все SUBSCRIBE подключения подтверждены SUBACK без отказов ([confirmed]).
+ * - Продолжаемая сессия ([persistent], SEVEN-251): брокер помнит подписки между подключениями. Помнится, какие фильтры
+ *   могли остаться у брокера (отправлены в SUBSCRIBE и не сняты UNSUBSCRIBE в живой сессии); при Session Present = 1
+ *   снятые за время обрыва уходят UNSUBSCRIBE перед подпиской всего набора, при Session Present = 0 память
+ *   сбрасывается. Весь желаемый набор подписывается после каждого CONNACK как обычно (брокер заново пришлёт retained).
  */
 @OptIn(MqttCoreApi::class)
 internal class SubscriptionSet(
     private val batch: Int,
     private val maxFilters: Int,
     private val actions: MutableList<EngineAction>,
+    private val persistent: Boolean = false,
 ) {
+    // Продолжаемая сессия: фильтры, которые брокер может держать в своей сессии
+    private val held = LinkedHashSet<String>()
     private val groups = LinkedHashMap<String, Map<String, Qos>>()
 
     // Живая сессия: что подписано (фильтр → QoS); состояние желаемых; SUBSCRIBE в ожидании SUBACK
@@ -86,6 +93,7 @@ internal class SubscriptionSet(
         applied = target
         for (filter in removed) lastPacket.remove(filter)
         removed.chunked(batch).forEach { core.unsubscribe(it, nowMs) }
+        if (persistent) held.removeAll(removed.toSet())
         val next = LinkedHashMap(states)
         next.keys.retainAll(target.keys)
         subscribe(core, added, next, nowMs)
@@ -95,10 +103,22 @@ internal class SubscriptionSet(
         return true
     }
 
-    /** CONNACK: весь набор порциями (накопленные разницы обрыва не нужны — `cleanStart`). */
-    fun sessionStarted(core: MqttSessionCore, nowMs: Long) {
+    /**
+     * CONNACK: весь набор порциями (накопленные разницы обрыва не нужны). [resumed] — Session Present = 1 продолжаемой
+     * сессии: сначала UNSUBSCRIBE фильтров, снятых за время обрыва, но оставшихся у брокера.
+     */
+    fun sessionStarted(core: MqttSessionCore, nowMs: Long, resumed: Boolean = false) {
         live = true
         applied = desired()
+        if (persistent) {
+            if (resumed) {
+                val leftovers = held.filter { it !in applied }
+                leftovers.chunked(batch).forEach { core.unsubscribe(it, nowMs) }
+                held.removeAll(leftovers.toSet())
+            } else {
+                held.clear()
+            }
+        }
         val next = LinkedHashMap<String, TopicState>()
         subscribe(core, applied, next, nowMs)
         publish(next)
@@ -155,6 +175,7 @@ internal class SubscriptionSet(
         actions += EngineAction.Log(EngineLogEvent.Subscribe(filters.size))
         filters.entries.chunked(batch).forEach { chunk ->
             val packetId = core.subscribe(chunk.map { SubscriptionRequest(it.key, it.value) }, nowMs)
+            if (persistent) chunk.forEach { held += it.key }
             subscribesSent++
             inFlight[packetId] = chunk.map { it.key }
             for (entry in chunk) {

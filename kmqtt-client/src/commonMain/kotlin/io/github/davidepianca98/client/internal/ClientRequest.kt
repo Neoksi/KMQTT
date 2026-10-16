@@ -11,6 +11,7 @@ import io.github.davidepianca98.client.core.SessionSettings
 import io.github.davidepianca98.client.core.WillSpec
 import io.github.davidepianca98.client.engine.EngineCommand
 import io.github.davidepianca98.client.engine.EngineOptions
+import io.github.davidepianca98.mqtt.MQTTVersion
 import io.github.davidepianca98.mqtt.packets.Qos
 import kotlinx.coroutines.CompletableDeferred
 
@@ -48,6 +49,8 @@ internal fun MqttClientOptions.toEngineOptions(): EngineOptions = EngineOptions(
         closeLingerMs = closeLinger.inWholeMilliseconds,
         maxIncomingPacket = limits.maxIncomingPacket,
         maxTopicLength = limits.maxTopicLength,
+        cleanStart = !persistentSession,
+        sessionExpiryIntervalSec = if (persistentSession && version == MQTTVersion.MQTT5) sessionExpirySeconds() else null,
     ),
     connectTimeoutMs = connectTimeout.inWholeMilliseconds,
     reconnect = reconnect,
@@ -55,4 +58,13 @@ internal fun MqttClientOptions.toEngineOptions(): EngineOptions = EngineOptions(
     subscribeBatch = limits.subscribeBatch,
     consumerStallLimitMs = limits.consumerStallLimit.inWholeMilliseconds,
     maxFilters = limits.maxFilters,
+    maxUnacknowledged = limits.maxUnacknowledged,
 )
+
+/** Session Expiry Interval в секундах (SEVEN-251): `INFINITE` и всё больше предела MQTT 5 — «не истекает». */
+@OptIn(MqttCoreApi::class)
+private fun MqttClientOptions.sessionExpirySeconds(): Long = if (sessionExpiry.isInfinite()) {
+    SessionSettings.MAX_SESSION_EXPIRY
+} else {
+    sessionExpiry.inWholeSeconds.coerceAtMost(SessionSettings.MAX_SESSION_EXPIRY)
+}

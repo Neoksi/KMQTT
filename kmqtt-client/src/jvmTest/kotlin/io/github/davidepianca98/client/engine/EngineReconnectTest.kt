@@ -21,6 +21,7 @@ import io.github.davidepianca98.mqtt.packets.mqtt.MQTTPingreq
 import io.github.davidepianca98.mqtt.packets.mqtt.MQTTPublish
 import io.github.davidepianca98.mqtt.packets.mqtt.MQTTSubscribe
 import io.github.davidepianca98.mqtt.packets.mqtt.MQTTUnsubscribe
+import io.github.davidepianca98.mqtt.packets.mqttv4.ConnectReturnCode
 import io.github.davidepianca98.mqtt.packets.mqttv5.MQTT5Properties
 import io.github.davidepianca98.mqtt.packets.mqttv5.ReasonCode
 import kotlin.test.Test
@@ -667,11 +668,20 @@ class EngineReconnectTest {
         offlineCapacity: Int = 64,
         val session: SessionSettings = SessionSettings(version, clientId = "c", keepAliveSec = 0),
         maxFilters: Int = 4096,
+        maxUnacknowledged: Int = 64,
     ) {
         var now = 0L
         private var epochs = 100L
         val engine = MqttClientEngine(
-            EngineOptions(HOST, PORT, session, reconnect = reconnect, offlineCapacity = offlineCapacity, maxFilters = maxFilters),
+            EngineOptions(
+                HOST,
+                PORT,
+                session,
+                reconnect = reconnect,
+                offlineCapacity = offlineCapacity,
+                maxFilters = maxFilters,
+                maxUnacknowledged = maxUnacknowledged,
+            ),
             nextEpoch = { ++epochs },
         )
         val script = BrokerScript(version)
@@ -684,6 +694,9 @@ class EngineReconnectTest {
         var connectHangs = false
         var connackCode = ReasonCode.SUCCESS
         var connackProps: () -> MQTT5Properties = { MQTT5Properties() }
+
+        /** Session Present в CONNACK (SEVEN-251). */
+        var sessionPresent = false
         var suback = Suback.GRANTED
 
         /** Код SUBACK по фильтру (T03b); `null` — по [suback]. */
@@ -713,9 +726,10 @@ class EngineReconnectTest {
             retain: Boolean = false,
             ttlMs: Long = 10_000,
             until: PublishStage = PublishStage.Sent,
+            resend: Boolean = true,
         ): PublishTicket {
             val ticket = PublishTicket(++tickets)
-            command(EngineCommand.Publish(ticket, topic, "v".encodeToByteArray(), qos, retain, ttlMs, until))
+            command(EngineCommand.Publish(ticket, topic, "v".encodeToByteArray(), qos, retain, ttlMs, until, resend))
             return ticket
         }
 
@@ -823,9 +837,9 @@ class EngineReconnectTest {
             when (packet) {
                 is MQTTConnect -> inbound += TransportEvent.Bytes(
                     if (version == MQTTVersion.MQTT5) {
-                        script.connack(connackCode, properties = connackProps())
+                        script.connack(connackCode, sessionPresent, connackProps())
                     } else {
-                        script.connack()
+                        script.connack4(ConnectReturnCode.CONNECTION_ACCEPTED, sessionPresent)
                     },
                 )
                 is MQTTSubscribe -> {

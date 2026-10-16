@@ -37,8 +37,13 @@ public class WillSpec(
  *
  * @param clientId null — случайный идентификатор (как у старого клиента).
  * @param keepAliveSec 0..65535; 0 — keepAlive выключен.
- * @param cleanStart ядро живёт одно подключение и не досылает неподтверждённое после переподключения, поэтому
- *   `cleanStart = false` поддержан только на уровне флага CONNECT (сессия на стороне брокера); досылка — забота движка.
+ * @param cleanStart флаг Clean Start (MQTT 5) / Clean Session (3.1.1) в CONNECT. Ядро живёт одно подключение и само
+ *   ничего не досылает; при `false` продолжение сессии (досылка неподтверждённого с DUP = 1 при Session Present = 1)
+ *   ведёт движок через [MqttSessionCore.resendPublish]/[MqttSessionCore.resendPubrel] (SEVEN-251). При `true` CONNACK
+ *   с Session Present = 1 — ошибка протокола.
+ * @param sessionExpiryIntervalSec MQTT 5 Session Expiry Interval в секундах (0..4294967295; 4294967295 — сессия не
+ *   истекает); `null` — свойство не отправляется (у брокера 0: сессия кончается с соединением). В 3.1.1 не
+ *   используется: срок сессии при Clean Session = 0 задаёт брокер.
  * @param connackTimeoutMs ожидание CONNACK от [MqttSessionCore.start].
  * @param closeLingerMs после DISCONNECT ждать закрытия соединения брокером (H1); 0 — `Closed(null)` сразу.
  * @param maxIncomingPacket лимит входящего пакета (с фиксированным заголовком); в MQTT 5 объявляется брокеру
@@ -64,6 +69,7 @@ public class SessionSettings(
     public val maxTopicLength: Int = 1024,
     public val receiveMaximum: Int = 65_535,
     public val topicAliasMaximum: Int = 0,
+    public val sessionExpiryIntervalSec: Long? = null,
 ) {
     init {
         require(keepAliveSec in 0..65_535) { "Keep alive exceeding the maximum value" }
@@ -78,16 +84,23 @@ public class SessionSettings(
         require(maxTopicLength >= 1) { "maxTopicLength < 1" }
         require(receiveMaximum in 1..65_535) { "receiveMaximum out of 1..65535" }
         require(topicAliasMaximum in 0..65_535) { "topicAliasMaximum out of 0..65535" }
+        require(sessionExpiryIntervalSec == null || sessionExpiryIntervalSec in 0..MAX_SESSION_EXPIRY) {
+            "sessionExpiryIntervalSec out of 0..4294967295"
+        }
     }
 
     override fun toString(): String =
         "SessionSettings(version=$version, clientId=${if (clientId == null) "null" else "set"}, " +
             "credentials=$credentials, keepAliveSec=$keepAliveSec, cleanStart=$cleanStart, will=$will, " +
             "connackTimeoutMs=$connackTimeoutMs, closeLingerMs=$closeLingerMs, maxIncomingPacket=$maxIncomingPacket, " +
-            "maxTopicLength=$maxTopicLength, receiveMaximum=$receiveMaximum, topicAliasMaximum=$topicAliasMaximum)"
+            "maxTopicLength=$maxTopicLength, receiveMaximum=$receiveMaximum, topicAliasMaximum=$topicAliasMaximum, " +
+            "sessionExpiryIntervalSec=$sessionExpiryIntervalSec)"
 
-    private companion object {
-        fun hasWildcard(topic: String): Boolean =
+    public companion object {
+        /** Наибольший Session Expiry Interval MQTT 5 (4294967295 с — «не истекает»). */
+        public const val MAX_SESSION_EXPIRY: Long = 0xFFFF_FFFFL
+
+        private fun hasWildcard(topic: String): Boolean =
             topic.indexOf('+') >= 0 || topic.indexOf('#') >= 0 || topic.indexOf('\u0000') >= 0
     }
 }
