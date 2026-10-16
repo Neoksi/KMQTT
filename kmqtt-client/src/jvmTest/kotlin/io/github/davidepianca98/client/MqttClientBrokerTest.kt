@@ -219,6 +219,22 @@ internal class MqttClientBrokerTest : BrokerTestBase() {
         assertTrue(inbox.messages.none { it.topic == "res/expired" }, "просроченная публикация дошла до брокера")
     }
 
+    /** Брокер остановлен посреди сессии: публикация ждёт соединения TTL = 1 с и завершается `Expired`. */
+    @Test
+    fun publishExpiresAfterTheBrokerIsStopped() = timed {
+        val broker = broker()
+        val client = client(broker.port)
+        val epoch = client.up().epoch
+        assertEquals(PublishResult.Sent(epoch), client.publish("res/alive", byteArrayOf(1)))
+        broker.stop()
+        BrokerTestKit.waitUntil(10_000, "клиент потерял соединение") { client.connection.value !is ConnectionState.Connected }
+
+        val started = System.currentTimeMillis()
+        assertEquals(PublishResult.Expired, client.publish("res/dead", byteArrayOf(2), ttl = 1.seconds))
+        val elapsed = System.currentTimeMillis() - started
+        assertTrue(elapsed in 900..3_000, "Expired через TTL: $elapsed мс")
+    }
+
     @Test
     fun pendingPublishFailsClosedOnCloseAndPublishAfterCloseToo() = timed {
         val client = client(TestBroker.freePort())
