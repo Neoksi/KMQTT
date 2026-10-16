@@ -715,9 +715,11 @@ public class ClientConnection(
                 if (!(subscription.options.noLocal && session!!.clientId == clientId)) {
                     val qos = Qos.min(retainedMessage.qos, subscription.options.qos)
 
+                    // MQTT-3.3.1-8: a retained message sent on a new subscription always has RETAIN set to 1
+                    // (Retain As Published only affects messages forwarded after the subscription)
                     if (currentReceivedPacket.mqttVersion == MQTTVersion.MQTT5) {
                         retainedMessagesList += MQTT5Publish(
-                            if (subscription.options.retainedAsPublished) retainedMessage.retain else false,
+                            true,
                             qos,
                             false,
                             retainedMessage.topicName,
@@ -727,7 +729,7 @@ public class ClientConnection(
                         )
                     } else {
                         retainedMessagesList += MQTT4Publish(
-                            if (subscription.options.retainedAsPublished) retainedMessage.retain else false,
+                            true,
                             qos,
                             false,
                             retainedMessage.topicName,
