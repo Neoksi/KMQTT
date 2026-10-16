@@ -11,7 +11,6 @@ import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
 import kotlin.test.assertIs
-import kotlin.test.assertTrue
 import kotlin.test.fail
 
 /**
@@ -93,7 +92,8 @@ internal class TlsBrokerTest : BrokerTestBase() {
         val text = state.toString()
         println("TlsBrokerTest: состояние после отказа TLS: $text")
         assertFalse(TestBroker.HOST in text || "localhost" in text, "ошибка TLS раскрывает адрес или имя: $text")
-        assertTrue(strict.connection.value !is ConnectionState.Connected)
+        assertIs<MqttError.Io>(state.lastError)
+        assertEquals("ssl", (state.lastError as MqttError.Io).kind, "ошибка рукопожатия TLS, а не отказ подключения")
     }
 
     /** Без закрепления сертификата доверие — системное хранилище: самоподписанный сертификат брокера отклоняется. */
@@ -105,6 +105,8 @@ internal class TlsBrokerTest : BrokerTestBase() {
         BrokerTestKit.waitUntil(10_000, "ошибка рукопожатия в состоянии клиента") {
             client.connection.value is ConnectionState.Waiting
         }
-        assertTrue(client.connection.value !is ConnectionState.Connected)
+        val error = (client.connection.value as ConnectionState.Waiting).lastError
+        assertIs<MqttError.Io>(error)
+        assertEquals("ssl", error.kind, "ошибка рукопожатия TLS, а не отказ подключения")
     }
 }

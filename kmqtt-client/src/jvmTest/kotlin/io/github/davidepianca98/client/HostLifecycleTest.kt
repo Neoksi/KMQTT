@@ -169,7 +169,10 @@ internal class HostLifecycleTest : BrokerTestBase() {
         println("HostLifecycleTest.closeBeforeConnack: close() занял $closeMs мс")
         assertTrue(closeMs < 1_000, "close() до CONNACK занял $closeMs мс")
 
-        val end = received.poll(5, TimeUnit.SECONDS) ?: fail("сервер не увидел конца соединения")
+        var end: Any
+        do {
+            end = received.poll(5, TimeUnit.SECONDS) ?: fail("сервер не увидел конца соединения")
+        } while (end == "data")
         val bytes = end as? ByteArray ?: fail("RST вместо EOF у сервера: $end")
         assertEquals(0x10, bytes[0].toInt() and 0xF0, "единственный пакет — CONNECT")
         assertEquals(2 + (bytes[1].toInt() and 0x7F), bytes.size, "после CONNECT нет других пакетов (DISCONNECT)")

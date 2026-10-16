@@ -79,7 +79,7 @@ internal class GracefulCloseTest : BrokerTestBase() {
         withTimeout(15_000) { client.close() }
         val closeMs = (System.nanoTime() - started) / 1_000_000
         println("GracefulCloseTest.linger($version): close() занял $closeMs мс")
-        assertTrue(closeMs in 2_900..4_000, "close() ждёт closeLinger 3 с (ожидалось 3000–3500): $closeMs мс")
+        assertTrue(closeMs in 2_900..3_500, "close() ждёт closeLinger 3 с (ожидалось 3000–3500): $closeMs мс")
 
         assertEquals(RawEnd.EOF, server.awaitEnd(10_000), "RST вместо EOF после linger; пакеты ${server.packetTypes}")
         assertNull(server.writeFailure)
