@@ -451,6 +451,25 @@ class EngineReconnectTest {
     }
 
     @Test
+    fun publishAndCloseBackToBackGiveWritePublishCompleteWriteDisconnect() {
+        val rig = Rig()
+        rig.eofOnDisconnect = false
+        rig.start()
+        val ticket = PublishTicket(99)
+        rig.engine.onCommand(
+            EngineCommand.Publish(ticket, "a/b", byteArrayOf(1), Qos.AT_LEAST_ONCE, true, 1_000, PublishStage.Sent),
+            rig.now,
+        )
+        rig.engine.onCommand(EngineCommand.Close(), rig.now)
+        val batch = rig.engine.takeActions()
+        assertEquals(3, batch.size, "$batch")
+        val parser = MQTTCurrentPacket(1024u * 1024u, MQTTVersion.MQTT5)
+        assertTrue(parser.addData((batch[0] as EngineAction.Write).bytes.asUByteArray()).single() is MQTTPublish)
+        assertEquals(EngineAction.Complete(ticket, PublishResult.Sent(101)), batch[1])
+        assertTrue(parser.addData((batch[2] as EngineAction.Write).bytes.asUByteArray()).single() is MQTTDisconnect)
+    }
+
+    @Test
     fun closeWithoutEofClosesTheTransportAfterTheLinger() {
         val rig = Rig()
         rig.eofOnDisconnect = false
