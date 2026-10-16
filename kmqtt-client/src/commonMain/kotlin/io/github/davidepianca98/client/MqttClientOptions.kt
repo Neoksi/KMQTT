@@ -38,7 +38,9 @@ import kotlin.time.Duration.Companion.seconds
  *   and disables the host name check regardless of this flag.
  * @param clientId MQTT client identifier; `null` generates a random one. It must be unique on the broker, because a
  *   second connection with the same identifier makes the broker drop the first.
- * @param keepAlive MQTT keep-alive interval, 0..65535 seconds; zero disables keep-alive.
+ * @param keepAlive MQTT keep-alive interval, 0..65535 seconds; zero disables keep-alive. The protocol carries whole
+ *   seconds, so a fractional part is dropped (1.5 s is sent as 1 s); a value between zero and one second is rejected,
+ *   because it would silently turn keep-alive off.
  * @param connectTimeout limit for the TCP (and TLS handshake) connection, including name resolution.
  * @param connackTimeout how long to wait for CONNACK after CONNECT.
  * @param closeLinger how long [MqttClient.close] waits after DISCONNECT for the broker to close the connection. With
@@ -75,6 +77,8 @@ public data class MqttClientOptions(
         require(host.isNotBlank()) { "host is blank" }
         require(port in 1..65_535) { "port out of 1..65535" }
         require(!keepAlive.isNegative() && keepAlive.inWholeSeconds <= 65_535) { "keepAlive out of 0..65535 s" }
+        // Протокол передаёт целые секунды: (0, 1 с) обнулилось бы и молча выключило keep-alive (SEVEN-255, D7)
+        require(keepAlive == Duration.ZERO || keepAlive >= 1.seconds) { "keepAlive in (0, 1 s): use 0 to disable or >= 1 s" }
         require(connectTimeout.isPositive()) { "connectTimeout <= 0" }
         require(connackTimeout.isPositive()) { "connackTimeout <= 0" }
         require(!closeLinger.isNegative()) { "closeLinger < 0" }

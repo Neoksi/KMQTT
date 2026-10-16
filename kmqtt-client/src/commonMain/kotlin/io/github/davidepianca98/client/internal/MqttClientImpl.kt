@@ -305,6 +305,9 @@ internal class MqttClientImpl(
             pauseRequested = true
             readPaused.value = true
             engine.onCommand(EngineCommand.SetReadPaused(true), now)
+            // D5 ревью G1 (SEVEN-255): потребитель мог опустошить канал между неудачным trySend и флагом и уснуть
+            // без пробуждения хоста. Флаг уже стоит: переложить ещё раз — всё, что он возьмёт дальше, разбудит хост
+            while (overflow.isNotEmpty() && incomingChannel.trySend(overflow.first()).isSuccess) overflow.removeFirst()
         }
     }
 

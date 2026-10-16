@@ -142,8 +142,9 @@ connection-management layer.
 **Where it exists.** This client exists only in this fork (`Neoksi/KMQTT`, branch `new_mqtt_client`), not in upstream
 and not in the Maven `1.0.0` artifacts mentioned above. Build the fork from source, for example with a Gradle
 `includeBuild` that substitutes `io.github.davidepianca98:kmqtt-client` (and `kmqtt-common`) by the fork's projects. The
-public API uses `kotlinx.coroutines` types (`Flow`, `StateFlow`, `Deferred`, `Job`) while the module declares the
-dependency as `implementation`, so add `kotlinx-coroutines-core` to your own project.
+public API uses `kotlinx.coroutines` types (`Flow`, `StateFlow`, `Deferred`, `Job`) and `kmqtt-common` types (`Qos`,
+`ReasonCode`, `MQTTVersion`, `TLSClientSettings`); `kmqtt-client` exposes both modules as `api` dependencies, so they
+come with it.
 
 **Targets.** The API and the protocol engine are in `commonMain` and compile for every target, but the only I/O host
 that exists is the JVM one (`NioActorHost`, a `java.nio` selector on its own thread). On JavaScript and native targets
@@ -388,7 +389,10 @@ The broker never publishes the will after an orderly close.
   may publish the will.
 - `close()` cannot hang: the total time is bounded by `closeLinger` plus about 3 seconds, then the thread is stopped
   forcibly. A second call waits for the same shutdown.
-- Error paths (broken connection, keep-alive timeout, stalled consumer) close the socket at once.
+- Error paths without anything to send (broken connection, keep-alive timeout, stalled consumer) close the socket at
+  once. A protocol error found by the client on MQTT 5 is answered with `DISCONNECT` carrying the reason code: that
+  packet is written first (within about a second, like the tail of an orderly close), then the socket is closed without
+  waiting for the broker.
 
 ### Limitations of the first version
 

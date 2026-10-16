@@ -55,7 +55,8 @@ public fun interface NioTransportFactory {
  *   каждое — событие [TransportEvent.Bytes] с копией байтов. Запись: очередь `ByteBuffer`-обёрток над массивами
  *   вызывающего (без копирования, K7); неполная запись оставляет остаток и ставит `OP_WRITE`.
  * - Ошибки: `UnresolvedAddressException`/`UnknownHostException` → [MqttError.UnknownHost], прочие исключения →
- *   [MqttError.Io] с простым именем класса исключения (без адреса в `kind`); канал закрывается сразу.
+ *   [MqttError.Io] с простым именем класса исключения (без адреса в `kind`); канал закрывается сразу. Это относится
+ *   и к открытию канала (`SocketChannel.open()`, например при исчерпании дескрипторов) — ошибка подключения, не хоста.
  * - `TCP_NODELAY` включён: пакеты MQTT мелкие, задержка «команда → пакет» важнее (H4).
  *
  * Все методы — только на потоке хоста.
@@ -63,10 +64,14 @@ public fun interface NioTransportFactory {
 @MqttCoreApi
 public class NioTransport internal constructor(
     private val context: NioTransportContext,
+    private val openSocket: () -> SocketChannel,
     private val resolver: (String) -> Array<InetAddress>
 ) : MqttTransport {
 
     public constructor(context: NioTransportContext) : this(context, DefaultResolver)
+
+    internal constructor(context: NioTransportContext, resolver: (String) -> Array<InetAddress>) :
+        this(context, DefaultOpenSocket, resolver)
 
     private enum class Phase { Idle, Resolving, Connecting, Connected, Closed }
 
@@ -193,10 +198,11 @@ public class NioTransport internal constructor(
             fail(MqttError.UnknownHost)
             return
         }
-        val ch = SocketChannel.open()
-        channel = ch
         phase = Phase.Connecting
         try {
+            // Открытие канала — тоже в try (D1 ревью G1): «Too many open files» — ошибка подключения, не хоста
+            val ch = openSocket()
+            channel = ch
             ch.configureBlocking(false)
             ch.setOption(StandardSocketOptions.TCP_NODELAY, true)
             val connected = ch.connect(InetSocketAddress(address, port))
@@ -276,6 +282,8 @@ public class NioTransport internal constructor(
         const val READS_PER_READY: Int = 4
 
         val DefaultResolver: (String) -> Array<InetAddress> = { host -> InetAddress.getAllByName(host) }
+
+        val DefaultOpenSocket: () -> SocketChannel = { SocketChannel.open() }
 
         fun errorOf(e: Throwable): MqttError = when (e) {
             is UnresolvedAddressException, is UnknownHostException -> MqttError.UnknownHost

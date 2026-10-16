@@ -704,6 +704,19 @@ class MqttClientVirtualTest {
         for (secret in listOf("secret-pw", "login", "broker.test", "1883")) assertFalse(secret in text, text)
     }
 
+    /** SEVEN-255 (D7 ревью G1): keepAlive в (0, 1 с) молча выключил бы keep-alive — отказ; 0 и ≥ 1 с допустимы. */
+    @Test
+    fun subSecondKeepAliveIsRejected() {
+        for (bad in listOf(1.milliseconds, 500.milliseconds, 999.milliseconds)) {
+            val error = assertFailsWith<IllegalArgumentException>("$bad") { options().copy(keepAlive = bad) }
+            assertTrue("keepAlive" in error.message.orEmpty(), error.message)
+            assertFalse("broker.test" in error.message.orEmpty())
+        }
+        for (ok in listOf(Duration.ZERO, 1.seconds, 1_500.milliseconds, 65_535.seconds)) {
+            assertEquals(ok, options().copy(keepAlive = ok).keepAlive)
+        }
+    }
+
     @Test
     fun tlsOptionsWithForeignHostAreRefusedAtCreation() = runTest {
         val host = VirtualHost(this)

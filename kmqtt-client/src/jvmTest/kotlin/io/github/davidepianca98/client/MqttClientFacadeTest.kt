@@ -20,6 +20,7 @@ import kotlinx.coroutines.cancelAndJoin
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.flow.take
 import kotlinx.coroutines.flow.toList
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.withTimeout
 import java.net.InetAddress
@@ -381,6 +382,49 @@ class MqttClientFacadeTest {
         }
         host.step(5)
         assertIs<IllegalStateException>(withTimeout(5_000) { late.await() }.exceptionOrNull())
+    }
+
+    /**
+     * SEVEN-255 (D1 ревью G1) сквозь `NioActorHost`: фабрика транспорта бросает `IOException` (имитация EMFILE) —
+     * клиент уходит в `Waiting(Io)`, а не `Closed(Io("host"))`, хост жив и следующая попытка подключается к брокеру.
+     */
+    @Test
+    fun transportFactoryExceptionGoesToWaitingAndReconnects() = runBlocking<Unit> {
+        val port = ServerSocket(0).use { it.localPort }
+        val broker = Broker(port = port, host = "127.0.0.1")
+        val stop = java.util.concurrent.atomic.AtomicBoolean(false)
+        val worker = thread(name = "facade-test-broker-emfile", isDaemon = true) {
+            while (!stop.get()) broker.step()
+            broker.stop()
+        }
+        toClose += {
+            stop.set(true)
+            worker.join(5_000)
+        }
+        val failures = AtomicInteger(1)
+        val factory = NioTransportFactory { ctx ->
+            if (failures.getAndDecrement() > 0) throw java.io.IOException("Too many open files")
+            NioTransport(ctx)
+        }
+        val host = NioActorHost(nextHostThreadName(), MqttClock.Monotonic, factory, NioActorHost.DEFAULT_READ_BUFFER)
+        val options = MqttClientOptions(
+            host = "127.0.0.1",
+            port = port,
+            keepAlive = 10.seconds,
+            reconnect = ReconnectPolicy(initial = 200.milliseconds, max = 200.milliseconds, jitter = 0.0),
+        )
+        val client = MqttClient(options, host)
+        toClose += { runBlocking { withTimeout(10_000) { client.close() } } }
+        val states = Collections.synchronizedList(ArrayList<ConnectionState>())
+        val watcher = launch(Dispatchers.Default) { client.connection.collect { states += it } }
+        val connected = withTimeout(10_000) { client.connect() }
+        assertIs<ConnectResult.Connected>(connected)
+        watcher.cancelAndJoin()
+        val waiting = states.filterIsInstance<ConnectionState.Waiting>().single()
+        assertEquals("IOException", assertIs<MqttError.Io>(waiting.lastError).kind)
+        assertTrue(states.none { it is ConnectionState.Closed }, "клиент не закрывался: $states")
+        withTimeout(10_000) { client.close() }
+        assertEquals(ConnectionState.Closed(null), client.connection.value)
     }
 
     @Test

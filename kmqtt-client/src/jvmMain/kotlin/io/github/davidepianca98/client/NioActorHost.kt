@@ -22,7 +22,8 @@ internal fun nextHostThreadName(): String = NioActorHost.THREAD_NAME_PREFIX + ho
  * Цикл потока:
  * 1. события транспорта (результат резолва, дедлайн подключения, готовность сокета) → [HostDriver.runOnce];
  * 2. действия шага ([HostAction]) исполняются по порядку: `Connect` — новый транспорт из фабрики (прежний
- *    закрывается), неблокирующий connect с дедлайном; `Write` — запись без блокировки, остаток по `OP_WRITE`;
+ *    закрывается), неблокирующий connect с дедлайном (исключение фабрики или `connect` — событие
+ *    [TransportEvent.Failed] следующим оборотом, хост живёт); `Write` — запись без блокировки, остаток по `OP_WRITE`;
  *    `PauseRead` — снять/вернуть `OP_READ` текущего транспорта; `CloseTransport` — закрыть канал;
  *    `FlushAndClose` — отдать текущий транспорт на дописывание (S06b-T05f): он больше не текущий, его события
  *    отбрасываются, чтение включено, канал закрывается на обороте, где `pendingWriteBytes == 0`, или по сроку;
@@ -131,9 +132,8 @@ public class NioActorHost internal constructor(
                     when (action) {
                         is HostAction.Connect -> {
                             transport?.close()
-                            val created = transportFactory.create(context)
-                            transport = created
-                            created.connect(action.host, action.port, now + action.timeoutMs)
+                            transport = null
+                            transport = openTransport(context, action, now, pending)
                         }
                         is HostAction.Write -> transport?.write(action.bytes)
                         is HostAction.PauseRead -> transport?.setReadInterest(!action.paused)
@@ -187,6 +187,35 @@ public class NioActorHost internal constructor(
                 driver.onStopped(cause)
             } catch (_: Throwable) {
             }
+        }
+    }
+
+    /**
+     * Новый транспорт из фабрики и начало подключения (SEVEN-255, D1 ревью G1). Исключение фабрики или `connect`
+     * (например `IOException` «Too many open files» — кончились дескрипторы) — не остановка хоста, а ошибка этого
+     * подключения: [TransportEvent.Failed] с [MqttError.Io] в [pending] (драйвер получит его следующим оборотом,
+     * клиент уйдёт в `Waiting` и повторит по политике), транспорта нет. `Error` (`OutOfMemoryError` и т. п.) не
+     * перехватывается: хост останавливается, как раньше.
+     */
+    @OptIn(MqttCoreApi::class)
+    private fun openTransport(
+        context: NioTransportContext,
+        action: HostAction.Connect,
+        now: Long,
+        pending: MutableList<TransportEvent>
+    ): MqttTransport? {
+        var created: MqttTransport? = null
+        return try {
+            created = transportFactory.create(context)
+            created.connect(action.host, action.port, now + action.timeoutMs)
+            created
+        } catch (e: Exception) {
+            try {
+                created?.close()
+            } catch (_: Exception) {
+            }
+            pending += TransportEvent.Failed(NioTransport.errorOf(e))
+            null
         }
     }
 

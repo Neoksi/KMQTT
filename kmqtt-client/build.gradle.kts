@@ -46,8 +46,10 @@ kotlin {
         val commonMain by getting {
             dependencies {
                 implementation(kotlin("stdlib-common"))
-                implementation(project(":kmqtt-common"))
-                implementation(libs.kotlinx.coroutines.core)
+                // SEVEN-255 (D3): типы kmqtt-common (Qos, ReasonCode, MQTTVersion, TLSClientSettings) и kotlinx.coroutines
+                // (Flow, StateFlow, Deferred, Job) — в публичном API клиента, поэтому api, а не implementation
+                api(project(":kmqtt-common"))
+                api(libs.kotlinx.coroutines.core)
             }
         }
         val commonTest by getting {

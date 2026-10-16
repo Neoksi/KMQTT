@@ -553,6 +553,58 @@ class NioActorHostTest {
         assertTrue(runBlocking { host.close() })
     }
 
+    /**
+     * SEVEN-255 (D1 ревью G1): исключение фабрики транспорта или его `connect` (имитация EMFILE — кончились
+     * дескрипторы) — ошибка подключения `Failed(Io)`, хост не останавливается и следующий `Connect` проходит.
+     */
+    @Test
+    fun transportFactoryOrConnectExceptionIsConnectFailureAndHostSurvives() {
+        val server = server()
+        val calls = AtomicLong()
+        val factory = NioTransportFactory { ctx ->
+            when (calls.incrementAndGet()) {
+                1L -> throw java.io.IOException("Too many open files")
+                2L -> object : MqttTransport by NioTransport(ctx) {
+                    override fun connect(host: String, port: Int, deadlineMs: Long) {
+                        throw java.io.IOException("Too many open files")
+                    }
+                }
+                else -> NioTransport(ctx)
+            }
+        }
+        val driver = TestDriver()
+        val host = startedHost(driver, factory)
+        val thread = assertNotNull(driver.thread)
+        repeat(2) { attempt ->
+            driver.send(host, HostAction.Connect("127.0.0.1", server.localPort, 5_000))
+            val failed = assertIs<TransportEvent.Failed>(driver.awaitEvent(), "попытка ${attempt + 1}")
+            assertEquals("IOException", assertIs<MqttError.Io>(failed.error).kind)
+            assertEquals(1L, driver.stopped.count, "хост не остановлен")
+            assertTrue(thread.isAlive)
+        }
+        driver.send(host, HostAction.Connect("127.0.0.1", server.localPort, 5_000))
+        server.accept().also { toClose += it }
+        assertEquals(TransportEvent.Connected, driver.awaitEvent())
+        assertNull(driver.stopCause)
+    }
+
+    /** SEVEN-255 (D1): исключение `SocketChannel.open()` (EMFILE) внутри транспорта — `Failed(Io)`, не остановка хоста. */
+    @Test
+    fun socketOpenExceptionIsConnectFailure() {
+        val opens = AtomicLong()
+        val factory = NioTransportFactory { ctx ->
+            NioTransport(ctx, { opens.incrementAndGet(); throw java.io.IOException("Too many open files") }, NioTransport.DefaultResolver)
+        }
+        val driver = TestDriver()
+        val host = startedHost(driver, factory)
+        driver.send(host, HostAction.Connect("127.0.0.1", 1883, 5_000))
+        val failed = assertIs<TransportEvent.Failed>(driver.awaitEvent())
+        assertEquals("IOException", assertIs<MqttError.Io>(failed.error).kind)
+        assertEquals(1L, opens.get())
+        assertEquals(1L, driver.stopped.count, "хост не остановлен")
+        assertTrue(assertNotNull(driver.thread).isAlive)
+    }
+
     private fun InputStream.readExactly(count: Int): ByteArray {
         val out = ByteArray(count)
         var offset = 0

@@ -21,7 +21,8 @@ public sealed interface ConnectionState {
      * The session is established (CONNACK with success).
      *
      * @param epoch session number; it grows over the whole process, so a newer session always has a larger epoch.
-     * @param sessionPresent the flag from CONNACK; with the clean start the client always uses it is `false`.
+     * @param sessionPresent the Session Present flag from CONNACK. The client always connects with a clean start
+     *   (Clean Session in MQTT 3.1.1), so a compliant broker sends `false` here.
      * @param server properties announced by the broker.
      */
     public data class Connected(val epoch: Long, val sessionPresent: Boolean, val server: ServerInfo) : ConnectionState
