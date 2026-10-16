@@ -69,6 +69,8 @@ import kotlin.concurrent.Volatile
 /**
  * MQTT 3.1.1 and 5 client
  *
+ * Legacy: new code uses `io.github.davidepianca98.client.MqttClient`.
+ *
  * @param autoInit if true then the Connection will be automatically initialized after creation, otherwise you should call MQTTClient init manually, default value is true
  * @param mqttVersion sets the version of MQTT for this client MQTTVersion.MQTT3_1_1 or MQTTVersion.MQTT5
  * @param address the URL of the server without ws/wss/mqtt/mqtts

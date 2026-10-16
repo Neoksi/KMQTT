@@ -3,52 +3,61 @@ package io.github.davidepianca98.client
 import io.github.davidepianca98.mqtt.packets.mqttv5.ReasonCode
 
 /**
- * Причина конца подключения нового клиента.
+ * Why a connection of an [MqttClient] ended or could not be established.
  *
- * Безопасность (H11): ни поля, ни `toString()` не содержат адресов, топиков, нагрузок и паролей. У [Io] причина
- * печатается только именем класса исключения: текст исключения ввода-вывода часто содержит `host:port`.
+ * Security: neither fields nor `toString()` contain addresses, topics, payloads or passwords. For [Io] only the class
+ * name of the cause is printed, because the text of an I/O exception often contains `host:port`. Handshake errors of TLS
+ * are reported without the address or the names in the certificate.
  */
 public sealed interface MqttError {
-    /** CONNACK с кодом, отличным от успеха (3.1.1 — код возврата, переведённый в [ReasonCode]). */
+    /** The broker answered CONNECT with a failure code (with MQTT 3.1.1 the return code translated to [ReasonCode]). */
     public data class Refused(val code: ReasonCode) : MqttError
 
-    /** DISCONNECT от брокера (любой код, в т. ч. `SERVER_MOVED`/`USE_ANOTHER_SERVER` — без перехода, H10). */
+    /**
+     * The broker sent DISCONNECT with the given [code]. A redirect (`SERVER_MOVED`, `USE_ANOTHER_SERVER`) is never
+     * followed: the client always reconnects to the configured address.
+     */
     public data class ServerDisconnect(val code: ReasonCode) : MqttError
 
-    /** Нет ответа на PINGREQ за отведённое время. */
+    /** The broker did not answer PINGREQ in time. */
     public data object KeepAliveTimeout : MqttError
 
-    /** Нет CONNACK за `connackTimeout`. */
+    /** No CONNACK arrived within [MqttClientOptions.connackTimeout]. */
     public data object ConnackTimeout : MqttError
 
-    /** TCP/TLS-подключение не установлено за `connectTimeout`. */
+    /** The TCP (and TLS) connection was not established within [MqttClientOptions.connectTimeout]. */
     public data object ConnectTimeout : MqttError
 
-    /** Имя брокера не разрешилось. */
+    /** The host name could not be resolved. */
     public data object UnknownHost : MqttError
 
-    /** Нарушение протокола или некорректный пакет со стороны брокера. */
+    /** The broker violated the protocol or sent a malformed packet. */
     public data class Protocol(val code: ReasonCode) : MqttError
 
     /**
-     * Ошибка ввода-вывода. [kind] — короткая метка без адресов (например, `"read"`, `"write"`, `"connect"`);
-     * [cause] — исходное исключение для отладки, в `toString()` попадает только имя его класса.
+     * An I/O error. [kind] is a short label without addresses (for example `"read"`, `"write"`, `"connect"`, `"ssl"`
+     * for a TLS error, `"closed"` when the client was closed). [cause] is the original exception for debugging; its
+     * text is not part of `toString()`.
      */
     public data class Io(val kind: String, val cause: Throwable?) : MqttError {
         override fun toString(): String = "Io(kind=$kind, cause=${cause?.let { it::class.simpleName }})"
     }
 
-    /** Потребитель входящих не забирал сообщения дольше `consumerStallLimit` (обратное давление, W6 §4.5). */
+    /**
+     * The collector of [MqttClient.incoming] did not take messages for longer than [MqttLimits.consumerStallLimit] while
+     * the buffer was full, so the connection was closed.
+     */
     public data object ConsumerStalled : MqttError
 }
 
 /**
- * Почему входящий пакет отброшен без разрыва сессии (H9). Только числа: ни топика, ни нагрузки.
+ * Why an incoming packet was dropped without ending the session ([MqttLogger.dropped]). Numbers only: no topic and no
+ * payload.
  */
 public sealed interface DropReason {
-    /** Пакет целиком ([size] байт с фиксированным заголовком) больше лимита [limit]; тело пропущено потоково. */
+    /** The whole packet of [size] bytes (with the fixed header) exceeds [limit]; its body was skipped without buffering. */
     public data class TooLarge(val size: Int, val limit: Int) : DropReason
 
-    /** Топик PUBLISH длиной [length] байт UTF-8 длиннее лимита [limit]. */
+    /** The topic of a PUBLISH is [length] UTF-8 bytes long, more than [limit]. */
     public data class TopicTooLong(val length: Int, val limit: Int) : DropReason
 }

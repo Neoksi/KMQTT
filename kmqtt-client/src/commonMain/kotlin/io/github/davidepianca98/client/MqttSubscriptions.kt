@@ -20,58 +20,67 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 
 /**
- * Декларативные подписки клиента (W6 §4.1, §4.3). Подписки задаются **группами**: желаемое = объединение групп (QoS
- * фильтра — максимум по группам). В живой сессии изменение отправляет разницу (UNSUBSCRIBE снятых, затем SUBSCRIBE
- * добавленных) в порядке вызовов; после каждого CONNACK весь набор подписывается заново порциями
- * [MqttLimits.subscribeBatch]. Отказ брокера по фильтру (SUBACK ≥ 0x80) сессию не рвёт (H7): фильтр получает
- * [TopicState.Refused], выдаётся событие [refusals].
+ * Declarative subscriptions of an [MqttClient]. Subscriptions are set in named **groups**: the desired set is the union
+ * of all groups, and the QoS of a filter is the maximum over the groups that contain it. In a live session a change
+ * sends only the difference (UNSUBSCRIBE of the removed filters, then SUBSCRIBE of the added ones) in the order of the
+ * calls; after every CONNACK the whole desired set is subscribed again, in batches of [MqttLimits.subscribeBatch]
+ * filters (a session is always clean, so the broker remembers nothing).
  *
- * Методы не блокируют и исполняются в одной очереди с публикациями (FIFO). Имена групп вида `temporary-<n>` заняты
- * [withTemporary].
+ * A broker refusal for a filter (SUBACK 0x80 or above) does not end the session: the filter gets [TopicState.Refused]
+ * and an event is emitted on [refusals]. A group that adds a filter already refused in the current session gets the
+ * refusal at once without another SUBSCRIBE. Filters are unsubscribed in batches of [MqttLimits.subscribeBatch] too.
  *
- * Отличия от `MQTTConnection` приложения (S06b-T03b): группа, добавившая фильтр, которому в этой сессии уже отказано,
- * получает отказ сразу (SUBSCRIBE не уходит); UNSUBSCRIBE уходит порциями по [MqttLimits.subscribeBatch]; повторный
- * SUBSCRIBE переводит фильтр в [TopicState.Pending] до нового SUBACK.
+ * The methods do not block and are queued together with publications, so they are executed in the order of the calls.
+ * Group names of the form `temporary-<n>` are reserved for [withTemporary].
  */
 public interface MqttSubscriptions {
-    /** Состояние каждого желаемого фильтра в текущей эпохе (без сессии — все [TopicState.Pending]). */
+    /**
+     * State of every desired filter in the current session. Without a live session all filters are
+     * [TopicState.Pending]. A repeated SUBSCRIBE of a filter returns it to [TopicState.Pending] until the new SUBACK.
+     */
     public val state: StateFlow<Map<String, TopicState>>
 
     /**
-     * Отказы брокера (ACL): событие на каждую группу, где есть отказанный фильтр; сессия продолжается.
-     * `SharedFlow` без повтора с буфером 64: событие видят только активные подписчики, при переполнении буфера
-     * медленным подписчиком новое событие теряется (состояние фильтра остаётся в [state]).
+     * Refusals of the broker (typically an access control list): one event for every group that contains a refused
+     * filter; the session continues. This is a shared flow without replay and with a buffer of 64 events: only active
+     * collectors see an event, and if a slow collector overflows the buffer the new event is lost (the state of the
+     * filter always stays in [state]).
      */
     public val refusals: Flow<SubscribeRefused>
 
     /**
-     * Задать набор группы [group] (пустой — снять группу). Набор, при котором различных фильтров во всех группах
-     * стало бы больше [MqttLimits.maxFilters], отклоняется: группа не меняется, `MqttLogger.groupRejected`, а
-     * [awaitApplied] этой группы бросает `IllegalStateException`, пока следующий `set` группы не пройдёт.
+     * Sets the filters of group [group] to [filters]; an empty set removes the group. If the groups together would hold
+     * more than [MqttLimits.maxFilters] distinct filters the call is refused: the group stays unchanged,
+     * [MqttLogger.groupRejected] is called, and [awaitApplied] of that group throws [IllegalStateException] until a
+     * later `set` of the group succeeds. After the client was closed the call does nothing.
      *
-     * [refreshShared] (дополнение к эскизу W6 §4.1, нужно миграции `setSubscriptions(refreshShared)`): фильтры
-     * группы, уже подписанные другой группой, подписываются ещё раз — брокер заново пришлёт их retained.
-     * После `close()` — ничего.
+     * @param qos requested QoS of the filters of this group.
+     * @param refreshShared when `true`, filters that another group has already subscribed are subscribed once more, so
+     *   that the broker sends their retained messages again.
      */
     public fun set(group: String, filters: Set<String>, qos: Qos = Qos.AT_MOST_ONCE, refreshShared: Boolean = false)
 
     /**
-     * Группа следует за потоком наборов [filters], пока жив [scope] и клиент не закрыт. Когда задание кончается
-     * (отмена [scope], конец потока, `close()`), группа снимается.
+     * Makes the group follow the flow [filters] while [scope] is alive and the client is not closed. When the returned
+     * [Job] ends (the scope is cancelled, the flow completes, or the client is closed) the group is removed.
      */
     public fun bind(group: String, filters: Flow<Set<String>>, qos: Qos, scope: CoroutineScope): Job
 
     /**
-     * Ждать SUBACK по всем фильтрам группы в текущей эпохе (нет живой сессии — ждёт подключения). Возвращает
-     * состояние фильтров группы (каждое — [TopicState.Granted] или [TopicState.Refused]); пустая или неизвестная
-     * группа — сразу пустая карта. Видит все `set`, вызванные раньше. Клиент закрыт (`close()` или сам —
-     * `ReconnectPolicy.Never`/исчерпан `maxAttempts`) — `IllegalStateException`.
+     * Suspends until the broker answered (SUBACK) for every filter of [group] in the current session; without a live
+     * session it waits for the connection. Returns the state of the filters of the group, each
+     * [TopicState.Granted] or [TopicState.Refused]; an empty or unknown group returns an empty map at once. It sees all
+     * `set` calls made before it. Throws [IllegalStateException] when the client is closed (by [MqttClient.close] or by
+     * itself, with [ReconnectPolicy.Never] or exhausted attempts) or when the last `set` of the group was refused for
+     * [MqttLimits.maxFilters].
      */
     public suspend fun awaitApplied(group: String): Map<String, TopicState>
 
     /**
-     * Временная группа (`temporary-<n>`) на время [block]; снимается и при отмене/исключении. Отказ брокера по любому
-     * её фильтру завершает [TemporaryGroup.refused] (обнаружение устройств: «нет прав» против «окно истекло»).
+     * Subscribes [filters] in a temporary group for the duration of [block] and removes the group afterwards, also when
+     * [block] is cancelled or throws. A broker refusal for any of the filters completes [TemporaryGroup.refused], which
+     * allows telling "not allowed" from "nothing arrived in time" (for example while discovering devices). Throws
+     * [IllegalStateException] when the client is already closed.
      */
     public suspend fun <T> withTemporary(
         filters: Set<String>,
@@ -80,15 +89,18 @@ public interface MqttSubscriptions {
     ): T
 
     /**
-     * Повторный SUBSCRIBE подписанных фильтров группы [group] (`null` — всех): брокер заново пришлёт retained
-     * (`refreshGroup`/`refreshSubscriptions` приложения). Без живой сессии — ничего.
+     * Subscribes the filters of [group] again (`null` means all groups) so that the broker re-sends their retained
+     * messages. Does nothing without a live session.
      */
     public fun resubscribe(group: String? = null)
 }
 
-/** Временная группа [MqttSubscriptions.withTemporary]. */
+/** A temporary group created by [MqttSubscriptions.withTemporary]. */
 public interface TemporaryGroup {
-    /** Первый отказ брокера по фильтру группы; после `close()` клиента завершается исключением. */
+    /**
+     * Completes with the first refusal of the broker for a filter of the group. It completes exceptionally when the
+     * client is closed and is cancelled when the block of [MqttSubscriptions.withTemporary] ends.
+     */
     public val refused: Deferred<SubscribeRefused>
 }
 

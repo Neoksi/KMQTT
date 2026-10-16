@@ -6,20 +6,25 @@ import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 
 /**
- * Политика переподключения нового клиента (W6 §4.2, H8). Перенос `ReconnectBackoff` приложения один-в-один
- * (контракт — `MqttReconnectTest`): задержка [initial], ×2 на каждую неудачную попытку, не больше [max]
- * (1 → 2 → 4 → 8 → 10 → 10 с); джиттер **только уменьшает** задержку (до доли [jitter] от неё), поэтому верхняя граница
- * детерминирована, а клиенты одного дома не стучатся в брокер одновременно.
+ * Reconnection policy of an [MqttClient]. The delay before an attempt starts at [initial], doubles after every failed
+ * attempt and never exceeds [max] (with the defaults 1, 2, 4, 8, 10, 10 seconds). Jitter only ever shortens the delay
+ * (by up to the fraction [jitter]), so the upper bound is deterministic while several clients do not hit the broker at
+ * the same moment.
  *
- * Счётчик попыток живёт в движке, а не здесь: политика — только конфигурация. Сброс счётчика — **только после
- * стабильной сессии**: все SUBSCRIBE подключения подтверждены SUBACK без отказов **или** подключение прожило не меньше
- * [stableAfter] после CONNACK. SUBACK с отказом успешным не считается: брокер, принимающий CONNECT и отказывающий
- * в подписке (ACL), иначе держал бы клиента в цикле «подключение раз в секунду».
+ * The attempt counter lives in the client, not here: the policy is configuration only. The counter and the delay are
+ * reset only after a stable session: either every SUBSCRIBE of the connection was acknowledged without refusals, or the
+ * connection lived at least [stableAfter] after CONNACK. A SUBACK that refuses a filter does not count as success;
+ * otherwise a broker that accepts CONNECT but denies the subscription (for example by ACL) would keep the client in a
+ * loop of one connection per second.
  *
- * @param maxAttempts сколько переподключений подряд разрешено после конца подключения (счётчик сбрасывает стабильная
- *   сессия вместе с задержкой); исчерпано — клиент закрывается с последней ошибкой (`ConnectionState.Closed(error)`).
- *   `null` — бесконечно; `0` — без переподключений ([Never]).
- * @param random источник случайности в `[0, 1)` (тесты подставляют свой).
+ * @param initial delay before the first retry; must be positive.
+ * @param max upper bound of the delay; at least [initial].
+ * @param jitter fraction 0..1 by which the delay may be shortened at random (0 disables jitter).
+ * @param stableAfter lifetime after CONNACK that makes a session stable on its own.
+ * @param maxAttempts how many reconnection attempts in a row are allowed after a connection ended (a stable session
+ *   resets the counter together with the delay); when they are exhausted the client closes with the last error
+ *   ([ConnectionState.Closed] carries it). `null` retries forever; `0` means no reconnection, see [Never].
+ * @param random source of random numbers in `[0, 1)`; tests supply their own.
  */
 public data class ReconnectPolicy(
     val initial: Duration = 1.seconds,
@@ -38,8 +43,8 @@ public data class ReconnectPolicy(
     }
 
     /**
-     * Задержка перед попыткой номер [attempt] (0 — первая после сброса), мс. Формула `ReconnectBackoff.next()`:
-     * `base = attempt ≥ 20 ? max : min(max, initial shl attempt)`, затем `base · (1 − jitter · random())`.
+     * Delay before attempt number [attempt] (0 is the first after a reset), in milliseconds:
+     * `base = attempt >= 20 ? max : min(max, initial shl attempt)`, then `base * (1 - jitter * random())`.
      */
     internal fun delayMs(attempt: Int): Long {
         val initialMs = initial.inWholeMilliseconds
@@ -51,7 +56,10 @@ public data class ReconnectPolicy(
     public companion object {
         private const val MAX_SHIFT = 20
 
-        /** Без переподключений: первый конец подключения закрывает клиент (`MQTTTestConnection`, проба брокера). */
+        /**
+         * No reconnection: the first end of a connection closes the client. Useful for a one-shot connection check;
+         * [MqttClient.connect] then returns the result of that single attempt.
+         */
         public val Never: ReconnectPolicy = ReconnectPolicy(maxAttempts = 0)
     }
 }
