@@ -115,16 +115,22 @@ class MqttClientJvmTest {
 
     private fun client(options: MqttClientOptions): MqttClient = MqttClient(options).also { clients += it }
 
-    private fun options(host: String, port: Int, tls: TLSClientSettings?, verifyHostname: Boolean = true) = MqttClientOptions(
-        host = host,
-        port = port,
-        tls = tls,
-        verifyHostname = verifyHostname,
-        keepAlive = 10.seconds,
-        connectTimeout = 10.seconds,
-        closeLinger = 1.seconds,
-        reconnect = ReconnectPolicy.Never,
-    )
+    /**
+     * [verifyHostname] `null` — умолчание [MqttClientOptions] (не передаётся): тест «проверка имени включена по
+     * умолчанию» должен краснеть, если умолчание сменят (SEVEN-255, мутационная проверка G1).
+     */
+    private fun options(host: String, port: Int, tls: TLSClientSettings?, verifyHostname: Boolean? = null): MqttClientOptions {
+        val options = MqttClientOptions(
+            host = host,
+            port = port,
+            tls = tls,
+            keepAlive = 10.seconds,
+            connectTimeout = 10.seconds,
+            closeLinger = 1.seconds,
+            reconnect = ReconnectPolicy.Never,
+        )
+        return if (verifyHostname == null) options else options.copy(verifyHostname = verifyHostname)
+    }
 
     @Test
     fun tlsOptionsConnectOverTlsWithPinnedCertificateAndHostnameCheck() = runBlocking<Unit> {

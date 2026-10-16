@@ -38,9 +38,11 @@ internal class TlsBrokerTest : BrokerTestBase() {
         return TLSSettings(keyStoreFilePath = file.absolutePath, keyStorePassword = "kmqtt-test")
     }
 
-    private fun tlsClient(port: Int, host: String, verifyHostname: Boolean, settings: TLSClientSettings): MqttClient {
+    /** [verifyHostname] `null` — умолчание [MqttClientOptions] не трогается (SEVEN-255: тест умолчания краснеет при его смене). */
+    private fun tlsClient(port: Int, host: String, verifyHostname: Boolean?, settings: TLSClientSettings): MqttClient {
         val options = options(port) {
-            it.copy(host = host, tls = settings, verifyHostname = verifyHostname)
+            val withTls = it.copy(host = host, tls = settings)
+            if (verifyHostname == null) withTls else withTls.copy(verifyHostname = verifyHostname)
         }
         // TLS-клиент создаётся только jvm-фабрикой: она сама строит хост с `NioTransportFactory.tls(...)`
         // (общая фабрика с чужим хостом при `tls != null` отказывает, SEVEN-227)
@@ -77,7 +79,7 @@ internal class TlsBrokerTest : BrokerTestBase() {
     @Test
     fun hostnameMismatchIsRefusedAndTheErrorLeaksNoAddress() = timed {
         val broker = broker(tlsSettings = brokerTlsSettings())
-        val strict = tlsClient(broker.port, TestBroker.HOST, true, TLSClientSettings(serverCertificate = serverPem))
+        val strict = tlsClient(broker.port, TestBroker.HOST, null, TLSClientSettings(serverCertificate = serverPem))
         // reconnect по умолчанию бесконечен: ждём первую ошибку в состоянии
         strict.start()
         BrokerTestKit.waitUntil(10_000, "ошибка рукопожатия в состоянии клиента") {
