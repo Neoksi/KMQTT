@@ -168,7 +168,11 @@ public class MqttClientEngine(
 
     public fun onTick(nowMs: Long) {
         for (expired in queue.expire(nowMs)) complete(expired, PublishResult.Expired)
-        expireResume(nowMs)
+        if (resume.isNotEmpty()) {
+            expireResume(nowMs)
+            // Истёкшие ждущие досылки больше не держат оффлайн-очередь живой сессии
+            if (resume.isEmpty() && phase == Phase.Connected) drainQueue(nowMs)
+        }
         val wake = reconnectAt
         if (phase == Phase.Waiting && !readPaused && wake != null && nowMs >= wake) connect(nowMs)
         core?.let { handle(it, it.onTick(nowMs), nowMs) }

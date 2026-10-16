@@ -273,6 +273,27 @@ class EnginePersistentSessionTest {
         assertTrue(rig.results(next).isEmpty())
     }
 
+    @Test
+    fun heldResendExpiringInALiveSessionReleasesTheQueue() {
+        val rig = connected(rig())
+        val publishedAt = rig.now
+        rig.publish("cmd/a", ttlMs = 60_000, until = PublishStage.Delivered)
+        val b = rig.publish("cmd/b", ttlMs = 1_500, until = PublishStage.Delivered)
+        rig.drop()
+        // Новое подключение: окно брокера — одна публикация, cmd/b ждёт досылки за cmd/a
+        rig.connackProps = { io.github.davidepianca98.mqtt.packets.mqttv5.MQTT5Properties(receiveMaximum = 1u) }
+        val mark = rig.packets.size
+        rig.reconnect()
+        assertEquals(listOf("cmd/a"), rig.publishesFrom(mark).map { it.topicName })
+        val c = rig.publish("cmd/c", qos = Qos.AT_MOST_ONCE)
+        assertTrue(rig.results(c).isEmpty(), "новая ждёт за недосланной")
+
+        rig.advance(publishedAt + 1_500 - rig.now)
+        assertEquals(listOf<PublishResult>(PublishResult.Expired), rig.results(b))
+        assertEquals(listOf("cmd/a", "cmd/c"), rig.publishesFrom(mark).map { it.topicName }, "очередь пошла без PUBACK")
+        assertEquals(listOf<PublishResult>(PublishResult.Sent(rig.lastEpoch())), rig.results(c))
+    }
+
     // ---- закрытие и исчерпание попыток ----
 
     @Test
