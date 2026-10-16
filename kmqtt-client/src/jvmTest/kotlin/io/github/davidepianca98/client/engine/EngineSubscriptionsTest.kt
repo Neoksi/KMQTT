@@ -353,6 +353,22 @@ class EngineSubscriptionsTest {
         assertTrue(rig.ended().isEmpty())
     }
 
+    /** Эпохи: ожидание SUBACK прошлого подключения забывается; новое ядро начинает packetId заново. */
+    @Test
+    fun anOutstandingSubackOfALostConnectionDoesNotLeakIntoTheNextEpoch() {
+        val rig = Rig()
+        rig.suback = Suback.SILENT
+        rig.start()
+        val lost = rig.lastSubscribeId()
+        rig.drop()
+        rig.suback = Suback.GRANTED
+        rig.advanceUntil { rig.started().size == 2 }
+
+        assertEquals(lost, rig.lastSubscribeId(), "the new core reuses the packet id")
+        assertEquals(TopicState.Granted(Qos.AT_MOST_ONCE), rig.topics()[K1])
+        assertTrue(rig.refusals().isEmpty() && rig.logs().none { it is EngineLogEvent.Refused })
+    }
+
     @Test
     fun missingSubackCodesCountAsRefusals() {
         val rig = Rig()
