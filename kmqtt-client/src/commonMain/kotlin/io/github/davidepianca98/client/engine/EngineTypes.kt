@@ -106,7 +106,8 @@ public sealed interface EngineCommand {
 
     /**
      * Обратное давление (W6 §4.5): потребитель входящих не успевает (`true`) или освободился (`false`). Движок
-     * передаёт паузу ядру и хосту ([EngineAction.PauseRead]) и повторяет её после каждого нового подключения.
+     * передаёт паузу ядру и хосту ([EngineAction.PauseRead]) и повторяет её после каждого нового подключения. В
+     * `Waiting` пауза держит переподключение до `SetReadPaused(false)` (S06b-T05g, KDoc [MqttClientEngine]).
      */
     public data class SetReadPaused(val paused: Boolean) : EngineCommand
 

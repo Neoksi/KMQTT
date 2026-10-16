@@ -26,9 +26,12 @@ import io.github.davidepianca98.mqtt.packets.mqttv5.ReasonCode
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
+import kotlin.test.assertIs
+import kotlin.test.assertNotNull
 import kotlin.test.assertTrue
 import kotlin.test.fail
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.seconds
 
 /**
  * Движок [MqttClientEngine] на виртуальном времени (S06b-T03a): перенесённые сценарии `MqttReconnectTest` приложения
@@ -532,18 +535,84 @@ class EngineReconnectTest {
     }
 
     @Test
-    fun consumerStallEndsTheSessionAndThePauseIsRepeatedAfterReconnect() {
+    fun consumerStallEndsTheSessionAndReconnectWaitsForTheConsumer() {
+        // S06b-T05g: пока чтение приостановлено, переподключения нет — ни Connect, ни срока
         val rig = Rig()
         rig.start()
         rig.command(EngineCommand.SetReadPaused(true))
         assertEquals(EngineAction.PauseRead(true), rig.actions.last())
         rig.advance(60_000)
         assertEquals(MqttError.ConsumerStalled, rig.emitted().filterIsInstance<MqttIncoming.SessionEnded>().single().error)
+        val waiting = assertIs<ConnectionState.Waiting>(rig.engine.state)
+        assertEquals(MqttError.ConsumerStalled, waiting.lastError)
 
         rig.actions.clear()
-        rig.advance(1_000)
+        rig.advance(600_000)
+        assertTrue(rig.actions.none { it is EngineAction.Connect || it is EngineAction.State }, "${rig.actions}")
+        assertEquals(null, rig.engine.nextDeadline())
+        assertEquals(waiting, rig.engine.state)
+
+        val resumedAt = rig.now
+        rig.command(EngineCommand.SetReadPaused(false))
+        assertTrue(rig.actions.none { it is EngineAction.Connect }, "подключение — на ближайшем тике, не из команды")
+        val deadline = assertNotNull(rig.engine.nextDeadline())
+        assertTrue(deadline <= resumedAt, "срок задержки давно прошёл — попытка сразу")
+        rig.advance(0)
         val connect = rig.actions.indexOfFirst { it is EngineAction.Connect }
-        assertEquals(EngineAction.PauseRead(true), rig.actions[connect + 1])
+        assertTrue(connect >= 0)
+        assertTrue(rig.actions.drop(connect).none { it == EngineAction.PauseRead(true) })
+        assertEquals(listOf(102L), rig.started(), "новая эпоха (действия до ожидания очищены)")
+        assertIs<ConnectionState.Connected>(rig.engine.state)
+    }
+
+    @Test
+    fun resumeBeforeTheBackoffDelayWaitsForTheDelay() {
+        val rig = Rig()
+        rig.start()
+        rig.command(EngineCommand.SetReadPaused(true))
+        rig.advance(60_000)
+        val endedAt = rig.now
+        assertEquals(1.seconds, assertIs<ConnectionState.Waiting>(rig.engine.state).delay)
+        rig.advance(300)
+        rig.command(EngineCommand.SetReadPaused(false))
+        assertEquals(endedAt + 1_000, rig.engine.nextDeadline())
+        rig.actions.clear()
+        rig.advance(699)
+        assertTrue(rig.actions.none { it is EngineAction.Connect })
+        rig.advance(1)
+        assertTrue(rig.actions.any { it is EngineAction.Connect })
+    }
+
+    @Test
+    fun pauseBeforeEofAlsoHoldsReconnectAndKeepsTheOriginalError() {
+        // Пауза из-за всплеска, затем брокер закрыл соединение: причина — EOF, переподключение ждёт потребителя
+        val rig = Rig()
+        rig.start()
+        rig.command(EngineCommand.SetReadPaused(true))
+        rig.drop()
+        val waiting = assertIs<ConnectionState.Waiting>(rig.engine.state)
+        assertTrue(waiting.lastError !is MqttError.ConsumerStalled)
+        rig.actions.clear()
+        rig.advance(600_000)
+        assertTrue(rig.actions.none { it is EngineAction.Connect })
+        assertEquals(waiting, rig.engine.state)
+        rig.command(EngineCommand.SetReadPaused(false))
+        rig.advance(0)
+        assertIs<ConnectionState.Connected>(rig.engine.state)
+    }
+
+    @Test
+    fun closeWhileWaitingForTheConsumerIsImmediate() {
+        val rig = Rig()
+        rig.start()
+        rig.command(EngineCommand.SetReadPaused(true))
+        rig.advance(60_000)
+        assertIs<ConnectionState.Waiting>(rig.engine.state)
+        rig.actions.clear()
+        rig.command(EngineCommand.Close())
+        assertEquals(ConnectionState.Closed(null), rig.engine.state)
+        assertTrue(rig.actions.none { it is EngineAction.Connect || it is EngineAction.Write })
+        assertEquals(null, rig.engine.nextDeadline())
     }
 
     @Test

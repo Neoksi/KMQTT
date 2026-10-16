@@ -309,11 +309,10 @@ socket**, so the pressure travels through TCP to the broker and nothing is dropp
 reading is paused, so the broker does not drop a healthy but slow client.
 
 If the collector takes nothing for longer than `MqttLimits.consumerStallLimit` (60 s) the client assumes the consumer is
-dead and closes the connection with `MqttError.ConsumerStalled`. *Intended behavior after that (being finalized in the
-fork; the code at the time of writing differs slightly):* the client stays in `Waiting(lastError = ConsumerStalled)`
-without any network activity until the consumer has drained the buffer, then reconnects. In the current code the next
-attempt starts at once with reading paused, so the new CONNACK waits behind the unread messages and a consumer that never
-returns turns this into repeated `ConnackTimeout` attempts. Either way, a broker's own queue may drop QoS 0 messages when
+dead and closes the connection with `MqttError.ConsumerStalled`. After that the client stays in
+`Waiting(lastError = ConsumerStalled)` without any network activity until the consumer has drained the buffer, and only
+then reconnects (never before the backoff delay has passed). A consumer that never returns leaves the client in
+`Waiting` until `close()`, which closes it at once. Note that a broker's own queue may drop QoS 0 messages when
 a client does not read for long (for example Mosquitto's `max_queued_messages`), so make the consumer fast or buffer on
 your side.
 

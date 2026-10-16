@@ -154,7 +154,8 @@ public data class OfflineQueue(val ttl: Duration = 10.seconds, val capacity: Int
  *   ([DropReason.TopicTooLong]).
  * @param incomingBuffer number of messages [MqttClient.incoming] buffers before the client stops reading the socket.
  * @param consumerStallLimit how long reading may stay paused because the buffer is full before the connection is closed
- *   with [MqttError.ConsumerStalled].
+ *   with [MqttError.ConsumerStalled]. A reconnect starts only after the consumer has drained the buffer: until then
+ *   the client stays in [ConnectionState.Waiting] without any network activity.
  * @param subscribeBatch number of filters in one SUBSCRIBE or UNSUBSCRIBE packet.
  * @param maxFilters number of distinct filters over all groups; a set that would exceed it is refused (the group stays
  *   unchanged, see [MqttSubscriptions.set]).

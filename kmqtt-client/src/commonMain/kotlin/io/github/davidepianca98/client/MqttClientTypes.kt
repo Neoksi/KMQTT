@@ -27,8 +27,12 @@ public sealed interface ConnectionState {
     public data class Connected(val epoch: Long, val sessionPresent: Boolean, val server: ServerInfo) : ConnectionState
 
     /**
-     * The connection ended with [lastError]; the next attempt, number [attempt], starts after [delay]. With
-     * [ReconnectPolicy.Never] or exhausted attempts the client goes to [Closed] instead.
+     * The connection ended with [lastError]; the next attempt, number [attempt], starts no earlier than after [delay].
+     * While the consumer of `incoming` has not drained the buffer (reading is paused, for example after
+     * [MqttError.ConsumerStalled]) there is no attempt at all: the client waits for the consumer without any network
+     * activity and connects as soon as the buffer has room. If the consumer never comes, `Waiting` stays until
+     * `close()` is called (it closes at once). With [ReconnectPolicy.Never] or exhausted attempts the client goes to
+     * [Closed] instead.
      */
     public data class Waiting(val attempt: Int, val delay: Duration, val lastError: MqttError) : ConnectionState
 

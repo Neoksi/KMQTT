@@ -363,37 +363,128 @@ class MqttClientVirtualTest {
         rig.client.close()
     }
 
-    @Test
-    fun afterConsumerStallReconnectWaitsForConsumerThenResumes() = runTest {
-        val rig = rig(
-            options(
-                reconnect = ReconnectPolicy(initial = 1.seconds, jitter = 0.0),
-                limits = MqttLimits(incomingBuffer = 2, consumerStallLimit = 5.seconds),
-            ),
-        )
+    // ---- переподключение после ConsumerStalled (S06b-T05g) ----
+
+    private fun stallOptions() = options(
+        reconnect = ReconnectPolicy(initial = 1.seconds, jitter = 0.0),
+        limits = MqttLimits(incomingBuffer = 2, consumerStallLimit = 5.seconds),
+    )
+
+    /** Подключиться, переполнить буфер без потребителя и дождаться разрыва по пределу паузы; эпоха первой сессии. */
+    private suspend fun TestScope.stalled(rig: Rig, states: List<ConnectionState>): Long {
         val first = rig.connected().epoch
         rig.broker.send(rig.broker.burst(0..4))
         runCurrent()
         advanceTimeBy(5_000)
         runCurrent()
         assertEquals(MqttError.ConsumerStalled, assertIs<ConnectionState.Waiting>(rig.client.connection.value).lastError)
-        advanceTimeBy(1_000)
-        runCurrent()
-        // Новое подключение начинается с паузой чтения: потребитель всё ещё не забрал старое — CONNACK ждёт в сокете
-        val second = rig.broker.current
-        assertEquals(2, rig.broker.transports.size)
-        assertFalse(second.readEnabled)
-        assertIs<ConnectionState.Connecting>(rig.client.connection.value)
+        assertIs<ConnectionState.Waiting>(states.last())
+        return first
+    }
 
+    private fun TestScope.recordStates(client: MqttClient): MutableList<ConnectionState> {
+        val states = ArrayList<ConnectionState>()
+        backgroundScope.launch(start = CoroutineStart.UNDISPATCHED) { client.connection.collect { states += it } }
+        return states
+    }
+
+    @Test
+    fun afterConsumerStallReconnectWaitsForConsumerThenResumes() = runTest {
+        val rig = rig(stallOptions())
+        val states = recordStates(rig.client)
+        val first = stalled(rig, states)
+        val stalledAt = currentTime
+        advanceTimeBy(10_000)
+        runCurrent()
+        // Потребителя нет — переподключения нет: тот же транспорт, то же Waiting(ConsumerStalled)
+        assertEquals(1, rig.broker.transports.size)
+        assertEquals(MqttError.ConsumerStalled, assertIs<ConnectionState.Waiting>(rig.client.connection.value).lastError)
+
+        val actionsBefore = rig.host.actions.size
         val items = collect(rig.client)
         runCurrent()
+        // Потребитель забрал старое — подключение сразу (срок задержки 1 с давно прошёл), без паузы чтения
+        assertEquals(2, rig.broker.transports.size)
+        val second = rig.broker.current
         assertTrue(second.readEnabled)
+        val after = rig.host.actions.drop(actionsBefore)
+        val connectAt = after.indexOfFirst { it is HostAction.Connect }
+        assertTrue(connectAt >= 0)
+        assertFalse(HostAction.PauseRead(true) in after.drop(connectAt), "$after")
+        assertEquals(stalledAt + 10_000, currentTime)
         val connected = assertIs<ConnectionState.Connected>(rig.client.connection.value)
         assertTrue(connected.epoch > first)
         assertEquals((0..4).toList(), payloads(items))
         assertEquals(MqttIncoming.SessionEnded(first, MqttError.ConsumerStalled), items[6])
         assertEquals(MqttIncoming.SessionStarted(connected.epoch), items[7])
+        assertEquals(8, items.size, "$items")
+        // Одно ожидание, затем одна попытка: Connected → Waiting → Connecting → Connected
+        val tail = states.dropWhile { it !is ConnectionState.Waiting }
+        assertEquals(1, tail.count { it is ConnectionState.Waiting }, "$states")
+        assertIs<ConnectionState.Connecting>(tail[1])
+        assertIs<ConnectionState.Connected>(tail[2])
+        assertEquals(3, tail.size, "$states")
         rig.client.close()
+    }
+
+    @Test
+    fun consumerArrivingBeforeBackoffDelayReconnectsAtTheDelay() = runTest {
+        val rig = rig(stallOptions())
+        val states = recordStates(rig.client)
+        stalled(rig, states)
+        val stalledAt = currentTime
+        advanceTimeBy(300)
+        runCurrent()
+        collect(rig.client)
+        runCurrent()
+        assertEquals(1, rig.broker.transports.size, "задержка 1 с от разрыва ещё не прошла")
+        advanceTimeBy(699)
+        runCurrent()
+        assertEquals(1, rig.broker.transports.size)
+        advanceTimeBy(1)
+        runCurrent()
+        assertEquals(2, rig.broker.transports.size)
+        assertEquals(stalledAt + 1_000, currentTime)
+        assertIs<ConnectionState.Connected>(rig.client.connection.value)
+        rig.client.close()
+    }
+
+    @Test
+    fun consumerNeverComesMeansOneWaitingWithoutNetworkActivity() = runTest {
+        val rig = rig(stallOptions())
+        val states = recordStates(rig.client)
+        stalled(rig, states)
+        val waiting = rig.client.connection.value
+        val steps = rig.host.steps
+        val statesBefore = states.size
+        advanceTimeBy(600_000)
+        runCurrent()
+        assertEquals(1, rig.broker.transports.size, "ни одной новой TCP-попытки")
+        assertEquals(1, rig.broker.log.count { it == "connect" })
+        assertEquals(1, rig.broker.log.count { it == "CONNECT" })
+        assertTrue(rig.broker.current.closed)
+        assertEquals(waiting, rig.client.connection.value)
+        assertEquals(MqttError.ConsumerStalled, assertIs<ConnectionState.Waiting>(waiting).lastError)
+        assertEquals(statesBefore, states.size, "$states")
+        assertEquals(1, states.count { it is ConnectionState.Waiting })
+        assertEquals(steps, rig.host.steps, "хост не просыпается: ни сроков, ни пробуждений")
+        rig.client.close()
+    }
+
+    @Test
+    fun closeWhileWaitingForConsumerIsImmediate() = runTest {
+        val rig = rig(stallOptions())
+        val states = recordStates(rig.client)
+        stalled(rig, states)
+        advanceTimeBy(60_000)
+        runCurrent()
+        val start = currentTime
+        rig.client.close()
+        assertEquals(start, currentTime, "close() из ожидания потребителя — сразу")
+        assertEquals(ConnectionState.Closed(null), rig.client.connection.value)
+        assertFalse(rig.host.isRunning)
+        assertTrue(rig.broker.transports.all { it.closed })
+        assertEquals(listOf("connect", "CONNECT", "close"), rig.broker.log)
     }
 
     // ---- закрытие ----

@@ -35,6 +35,13 @@ import kotlin.time.Duration.Companion.milliseconds
  *   подключения. Сброс счётчика — только после стабильной сессии: все SUBSCRIBE подключения подтверждены SUBACK без
  *   отказов **или** после CONNACK прошло ≥ `stableAfter` (`MQTTConnection.kt:341,380-381`); проверка — в конце
  *   подключения. Счётчик исчерпан (`maxAttempts`) — `State(Closed(error))`.
+ * - Переподключение при паузе чтения (S06b-T05g): пока действует [EngineCommand.SetReadPaused] `(true)`, движок в
+ *   `Waiting` не подключается и не выдаёт срока переподключения ([nextDeadline]) — новое подключение с приостановленным
+ *   чтением не прочло бы CONNACK и кончилось бы `ConnackTimeout`, скрыв настоящую причину. Состояние остаётся одним
+ *   `Waiting` с исходной `lastError` (после предела паузы — [MqttError.ConsumerStalled]). После `SetReadPaused(false)`
+ *   попытка — на ближайшем [onTick], не раньше срока задержки (отсчёт по-прежнему от конца подключения). Пауза, начатая
+ *   до разрыва по другой причине (EOF, ошибка), держит переподключение так же; `lastError` тогда — эта причина, предел
+ *   паузы в `Waiting` не считается. Потребитель не придёт никогда — `Waiting` без сетевой активности до [EngineCommand.Close].
  * - Публикация в живой сессии отдаётся ядру сразу, иначе ждёт в [OfflineQueue] до TTL. `Sent` выдаётся, когда
  *   PUBLISH отдан на запись ([EngineAction.Write] стоит перед [EngineAction.Complete]); подтверждения записи от хоста
  *   нет. `until = Delivered` ждёт PUBACK; у QoS 0 PUBACK не бывает — исход `Sent`. FlowControlled (окно Receive
@@ -94,7 +101,8 @@ public class MqttClientEngine(
         fun take(value: Long?) {
             if (value != null && (result == null || value < result!!)) result = value
         }
-        if (phase == Phase.Waiting) take(reconnectAt)
+        // Пауза чтения держит переподключение (S06b-T05g): срока нет, хост не просыпается, пока потребитель не разберёт буфер
+        if (phase == Phase.Waiting && !readPaused) take(reconnectAt)
         take(core?.nextDeadline())
         take(stallDeadline())
         return result
@@ -133,7 +141,7 @@ public class MqttClientEngine(
     public fun onTick(nowMs: Long) {
         for (expired in queue.expire(nowMs)) complete(expired, PublishResult.Expired)
         val wake = reconnectAt
-        if (phase == Phase.Waiting && wake != null && nowMs >= wake) connect(nowMs)
+        if (phase == Phase.Waiting && !readPaused && wake != null && nowMs >= wake) connect(nowMs)
         core?.let { handle(it, it.onTick(nowMs), nowMs) }
         val stall = stallDeadline()
         if (stall != null && nowMs >= stall) {
