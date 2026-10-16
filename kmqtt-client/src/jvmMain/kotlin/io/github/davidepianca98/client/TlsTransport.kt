@@ -15,6 +15,7 @@ import java.security.spec.InvalidKeySpecException
 import java.security.spec.PKCS8EncodedKeySpec
 import java.util.Base64
 import javax.net.ssl.KeyManagerFactory
+import javax.net.ssl.SNIHostName
 import javax.net.ssl.SSLContext
 import javax.net.ssl.SSLEngine
 import javax.net.ssl.SSLEngineResult
@@ -447,6 +448,9 @@ internal fun createEngine(settings: TLSClientSettings, host: String, port: Int, 
     if (protocols.isEmpty()) throw SSLException("no TLS 1.2+ protocol enabled")
     params.protocols = protocols.toTypedArray()
     if (settings.checkServerCertificate && verifyHostname) params.endpointIdentificationAlgorithm = "HTTPS"
+    // ALPN и явное имя для SNI (upstream KMQTT, #95): по умолчанию SNI — имя хоста подключения
+    settings.alpnProtocols?.let { params.applicationProtocols = it.toTypedArray() }
+    settings.serverNameIndications?.let { params.serverNames = listOf(SNIHostName(it)) }
     engine.sslParameters = params
     return engine
 }

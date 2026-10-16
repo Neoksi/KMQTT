@@ -496,6 +496,31 @@ class TlsTransportTest {
         assertEquals(-1, clientEnd.poll(5, TimeUnit.SECONDS), "клиент закрыл штатно (FIN, не RST)")
     }
 
+    @Test
+    fun alpnAndExplicitSniFromSettingsReachTheEngine() {
+        val engine = createEngine(
+            TLSClientSettings(
+                checkServerCertificate = false,
+                alpnProtocols = listOf("mqtt"),
+                serverNameIndications = "broker.example"
+            ),
+            "127.0.0.1",
+            8883,
+            verifyHostname = true
+        )
+        assertEquals(listOf("mqtt"), engine.sslParameters.applicationProtocols.toList())
+        assertEquals(
+            listOf("broker.example"),
+            engine.sslParameters.serverNames.map { (it as javax.net.ssl.SNIHostName).asciiName }
+        )
+    }
+
+    @Test
+    fun withoutAlpnAndSniSettingsTheEngineKeepsTheDefaults() {
+        val engine = createEngine(TLSClientSettings(checkServerCertificate = false), "127.0.0.1", 8883, true)
+        assertTrue(engine.sslParameters.applicationProtocols.isEmpty())
+    }
+
     private companion object {
         val KEYSTORE_PASSWORD = "kmqtt-test".toCharArray()
     }
