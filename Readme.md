@@ -301,7 +301,8 @@ subs.resubscribe("sensors") // subscribe again so that the broker re-sends retai
   diagnostics. It conflates, so a collector may miss states; if you need the order relative to messages, use the session
   markers of `incoming`.
 - A QoS 1 message is acknowledged to the broker when the client puts it into the buffer, not when your code processes it.
-- The flow completes after `close()`; messages already buffered are delivered first.
+- The flow completes after `close()`; everything already received is delivered first, in order: the buffer, the
+  messages held back beyond it while reading was paused, and the final `SessionEnded`.
 
 ### Back pressure and `ConsumerStalled`
 

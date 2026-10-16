@@ -230,6 +230,80 @@ class MqttClientFacadeTest {
         assertFailsWith<IllegalStateException> { client.incoming.take(1).toList() }
     }
 
+    /** D2 (SEVEN-260): удержанные сверх канала, включая `SessionEnded` штатного закрытия, не теряются при `close()`. */
+    @Test
+    fun closeDeliversMessagesHeldBeyondTheBufferAndSessionEnded() = runBlocking<Unit> {
+        val (client, host) = connected(options(incomingBuffer = 1))
+        // Канал (1) занят SessionStarted — весь залп удерживается, чтение на паузе
+        val burst = (0 until 4).map { script.publish("t", byteArrayOf(it.toByte())) }.reduce { a, b -> a + b }
+        assertTrue(HostAction.PauseRead(true) in host.step(3, TransportEvent.Bytes(burst)).actions)
+        closeDriven(client, host, from = 4)
+        val items = withTimeout(5_000) { client.incoming.toList() }
+        assertIs<MqttIncoming.SessionStarted>(items.first())
+        assertEquals((0 until 4).toList(), items.drop(1).dropLast(1).map { (it as MqttIncoming.Message).payload.single().toInt() })
+        val ended = assertIs<MqttIncoming.SessionEnded>(items.last())
+        assertEquals(null, ended.error)
+    }
+
+    /**
+     * D6 (SEVEN-260): аварийный `close()` — хост не остановился, его поток завис внутри шага (журнал блокирует).
+     * `close()` не ждёт поток хоста, `incoming` завершается; публикацию, которую держит поток хоста, он сам завершает
+     * отказом `Closed`, выйдя из шага.
+     */
+    @Test
+    fun emergencyCloseWithHostStuckInStepDoesNotHangAndHostFinishesItsPart() = runBlocking<Unit> {
+        val entered = CountDownLatch(1)
+        val release = CountDownLatch(1)
+        val logger = object : MqttLogger {
+            override fun connected(epoch: Long) {
+                entered.countDown()
+                release.await(30, TimeUnit.SECONDS)
+            }
+        }
+        val host = StuckHost()
+        val client = MqttClient(options(closeLinger = 0.seconds).copy(logger = logger), host)
+        client.start()
+        assertIs<HostAction.Connect>(host.step(0).actions.single())
+        written(host.step(1, TransportEvent.Connected))
+        val publishing = async(Dispatchers.Default, CoroutineStart.UNDISPATCHED) {
+            client.publish("a", byteArrayOf(1), until = PublishStage.Delivered)
+        }
+        host.step(2) // публикация у потока хоста (оффлайн-очередь)
+        val stuck = thread(isDaemon = true, name = "facade-test-stuck-host") {
+            host.step(3, TransportEvent.Bytes(script.connack()))
+        }
+        assertTrue(entered.await(5, TimeUnit.SECONDS), "шаг не дошёл до журнала")
+        val started = System.nanoTime()
+        withTimeout(10_000) { client.close() }
+        val tookMs = (System.nanoTime() - started) / 1_000_000
+        assertTrue(tookMs < MqttClientImpl.CLOSE_FLUSH_MS + MqttClientImpl.CLOSE_MARGIN_MS + 2_000, "close() занял $tookMs мс")
+        assertIs<ConnectionState.Closed>(client.connection.value)
+        withTimeout(5_000) { client.incoming.toList() }
+        assertFalse(publishing.isCompleted, "публикацию держит поток хоста — завершать её чужим потоком нельзя")
+        assertEquals(PublishResult.Failed(PublishFailure.Closed), client.publish("b", byteArrayOf(2)))
+
+        release.countDown()
+        stuck.join(5_000)
+        assertEquals(PublishResult.Failed(PublishFailure.Closed), withTimeout(5_000) { publishing.await() })
+        assertIs<ConnectionState.Closed>(client.connection.value)
+    }
+
+    /** Хост, который не останавливается за срок `close` (поток «завис»); шаги — вручную с любого потока. */
+    private class StuckHost : MqttHost {
+        @Volatile
+        var driver: HostDriver? = null
+
+        override fun start(driver: HostDriver) {
+            this.driver = driver
+        }
+
+        override fun wakeup() = Unit
+
+        override suspend fun close(timeoutMs: Long): Boolean = false
+
+        fun step(now: Long, vararg events: TransportEvent): HostStep = driver!!.runOnce(now, events.toList())
+    }
+
     @Test
     fun optionsToStringHasNoSecrets() {
         val options = MqttClientOptions(

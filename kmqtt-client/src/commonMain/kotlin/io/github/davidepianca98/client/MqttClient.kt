@@ -50,8 +50,11 @@ public interface MqttClient {
      * buffer is full the client stops reading the socket, so the pressure propagates through TCP to the broker and
      * nothing is dropped. If the collector takes nothing for longer than [MqttLimits.consumerStallLimit] the connection
      * is closed with [MqttError.ConsumerStalled]. An incoming QoS 1 message is acknowledged to the broker when it is put
-     * into the buffer, not when the collector processes it. The flow completes after [close]; messages already in the
-     * buffer are still delivered first.
+     * into the buffer, not when the collector processes it. The flow completes after [close]; everything the client has
+     * already received is still delivered first, in order: the buffer and the messages held back beyond it while reading
+     * was paused, including the final [MqttIncoming.SessionEnded]. Only in the emergency case of [close] (the I/O thread
+     * has not stopped in time and is still busy) the flow completes after the buffer, and the messages held beyond it may
+     * be lost.
      */
     public val incoming: Flow<MqttIncoming>
 

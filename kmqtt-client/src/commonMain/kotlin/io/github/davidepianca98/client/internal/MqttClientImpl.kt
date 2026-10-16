@@ -33,6 +33,7 @@ import kotlinx.atomicfu.locks.withLock
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.channels.Channel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -97,6 +98,15 @@ internal class MqttClientImpl(
     private val collected = atomic(false)
     private val tickets = atomic(0L)
     private val finalized = atomic(false)
+
+    /**
+     * Замок шага (D6 ревью G1, SEVEN-260): под ним [runOnce] и завершение ([finish]) — всё состояние потока хоста
+     * (`publishes`, `connectWaiters`, удержанные входящие [gate], подписки). Без соперничества (обычный случай — только
+     * поток хоста) стоит одну атомарную операцию. Аварийный путь [close] берёт его только через `tryLock`.
+     */
+    private val stepLock = reentrantLock()
+    private val hostFinished = atomic(false) // часть завершения под stepLock выполнена
+    private val finishError = atomic<MqttError?>(null)
 
     // ---- только поток хоста ----
     private val publishes = HashMap<PublishTicket, CompletableDeferred<PublishResult>>()
@@ -171,8 +181,9 @@ internal class MqttClientImpl(
                 val limit = config.closeLinger.inWholeMilliseconds + CLOSE_FLUSH_MS + CLOSE_MARGIN_MS
                 withTimeoutOrNull(limit) { drained.await() }
                 // Хост доводит дописывание (FlushAndClose) не дольше CLOSE_FLUSH_MS, затем останавливается
-                host.close(CLOSE_FLUSH_MS + HOST_CLOSE_TIMEOUT_MS)
-                finish(null)
+                val stopped = host.close(CLOSE_FLUSH_MS + HOST_CLOSE_TIMEOUT_MS)
+                // Остановился — onStopped уже всё закончил; нет — аварийный путь: поток хоста ещё может быть в шаге
+                if (stopped) finish(null) else finishFromForeignThread(null)
             }
             else -> closedSignal.await()
         }
@@ -200,7 +211,15 @@ internal class MqttClientImpl(
 
     // ---- HostDriver: поток хоста ----
 
-    override fun runOnce(nowMs: Long, events: List<TransportEvent>): HostStep {
+    override fun runOnce(nowMs: Long, events: List<TransportEvent>): HostStep = stepLock.withLock {
+        // Аварийное завершение с чужого потока могло случиться до шага или во время него (D6): часть потока хоста
+        // доделывается здесь, сам шаг после завершения не исполняется
+        val step = if (finalized.value) HostStep.Idle else step(nowMs, events)
+        if (finalized.value) finishHostPart()
+        step
+    }
+
+    private fun step(nowMs: Long, events: List<TransportEvent>): HostStep {
         now = nowMs
         wroteThisStep = false
         if (closeArmed) {
@@ -367,24 +386,82 @@ internal class MqttClientImpl(
     }
 
     /**
-     * Клиент закончен: незавершённые запросы и ожидания — с отказом, `incoming` завершается (буфер дочитывается).
-     * Один раз: из [onStopped] (поток хоста) или из [close] (хост не запускался либо не остановился за таймаут).
+     * Клиент закончен: незавершённые запросы и ожидания — с отказом, `incoming` завершается (дочитываются канал и
+     * удержанные сверх него, включая `SessionEnded`, D2). Один раз: из [onStopped] (поток хоста), из [close] после
+     * остановки хоста или без запуска хоста, из [submit] при отказе запуска. Поток хоста не работает либо это он сам,
+     * поэтому замок шага свободен (или уже наш).
      */
     private fun finish(error: MqttError?) {
+        stepLock.withLock {
+            finishShared(error)
+            finishHostPart()
+            finishSignals()
+        }
+    }
+
+    /**
+     * Аварийный путь [close] (D6): `host.close` не дождался выхода потока хоста, он может ещё исполнять шаг. Замок шага
+     * свободен (ждём его не дольше [FOREIGN_LOCK_WAIT_MS]: поток мог как раз выходить через [onStopped]) — завершаем
+     * целиком. Занят дольше (поток хоста в шаге, например в зависшем `MqttLogger`) — только
+     * потокобезопасная часть: `close()` не ждёт поток хоста; состояние потока хоста (публикации, ожидания, удержанные
+     * входящие) он доделает сам, выйдя из шага ([runOnce]). Удержанные сверх канала при этом могут не дойти до
+     * сборщика: канал закрывается сразу, чтобы `incoming` завершился и при навсегда зависшем потоке.
+     */
+    private suspend fun finishFromForeignThread(error: MqttError?) {
+        var waited = 0L
+        while (!stepLock.tryLock()) {
+            if (waited >= FOREIGN_LOCK_WAIT_MS) {
+                finishShared(error)
+                gate.closeChannel()
+                finishSignals()
+                return
+            }
+            delay(FOREIGN_LOCK_POLL_MS)
+            waited += FOREIGN_LOCK_POLL_MS
+        }
+        try {
+            finishShared(error)
+            finishHostPart()
+            finishSignals()
+        } finally {
+            stepLock.unlock()
+        }
+    }
+
+    /** Потокобезопасная часть: жизненный цикл, очередь запросов. Один раз. */
+    private fun finishShared(error: MqttError?) {
         if (!finalized.compareAndSet(false, true)) return
+        finishError.value = error
         lock.withLock { lifecycle = CLOSED }
         while (true) reject(requests.tryReceive().getOrNull() ?: break)
         requests.close()
+    }
+
+    /** Состояние потока хоста — только под [stepLock]. Один раз. */
+    private fun finishHostPart() {
+        if (!hostFinished.compareAndSet(false, true)) return
         for (pending in publishes.values.toList()) pending.complete(PublishResult.Failed(PublishFailure.Closed))
         publishes.clear()
-        val failed = ConnectResult.Failed(error ?: closedError())
+        val failed = ConnectResult.Failed(finishError.value ?: closedError())
         for (waiter in connectWaiters.toList()) waiter.complete(failed)
         connectWaiters.clear()
         subs.failAll()
-        if (error != null || stateFlow.value !is ConnectionState.Closed) stateFlow.value = ConnectionState.Closed(error)
-        gate.closeChannel()
+        closeState()
+        gate.close()
+    }
+
+    private fun finishSignals() {
+        closeState()
         drained.complete(Unit)
         closedSignal.complete(Unit)
+    }
+
+    private fun closeState() {
+        val error = finishError.value
+        val current = stateFlow.value
+        if (current !is ConnectionState.Closed || (error != null && current.error != error)) {
+            stateFlow.value = ConnectionState.Closed(error)
+        }
     }
 
     private fun reject(request: ClientRequest) {
@@ -413,6 +490,10 @@ internal class MqttClientImpl(
         /** Запас к `closeLinger` на штатное закрытие, прежде чем остановить хост принудительно. */
         const val CLOSE_MARGIN_MS: Long = 2_000
         const val HOST_CLOSE_TIMEOUT_MS: Long = 5_000
+
+        /** Аварийный путь [close]: сколько ждать замок шага, прежде чем завершить без потока хоста (D6). */
+        const val FOREIGN_LOCK_WAIT_MS: Long = 200
+        private const val FOREIGN_LOCK_POLL_MS: Long = 5
 
         /** Текст отказа при `tls != null` и хосте без TLS (без адресов и секретов). */
         const val TLS_HOST_REQUIRED: String =
