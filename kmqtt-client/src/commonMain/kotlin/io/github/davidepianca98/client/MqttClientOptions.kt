@@ -54,7 +54,8 @@ import kotlin.time.Duration.Companion.seconds
  * @param keepAlive MQTT keep-alive interval, 0..65535 seconds; zero disables keep-alive. The protocol carries whole
  *   seconds, so a fractional part is dropped (1.5 s is sent as 1 s); a value between zero and one second is rejected,
  *   because it would silently turn keep-alive off.
- * @param connectTimeout limit for the TCP (and TLS handshake) connection, including name resolution.
+ * @param connectTimeout limit for the TCP connection (with the TLS handshake and the WebSocket upgrade, when used),
+ *   including name resolution.
  * @param connackTimeout how long to wait for CONNACK after CONNECT.
  * @param closeLinger how long [MqttClient.close] waits after DISCONNECT for the broker to close the connection. With
  *   a positive value the socket is closed after the broker's FIN, which avoids a TCP reset (a reset can make the broker

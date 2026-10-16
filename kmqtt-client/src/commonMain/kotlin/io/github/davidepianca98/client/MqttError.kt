@@ -25,7 +25,10 @@ public sealed interface MqttError {
     /** No CONNACK arrived within [MqttClientOptions.connackTimeout]. */
     public data object ConnackTimeout : MqttError
 
-    /** The TCP (and TLS) connection was not established within [MqttClientOptions.connectTimeout]. */
+    /**
+     * The TCP connection (with TLS and the WebSocket upgrade, when used) was not established within
+     * [MqttClientOptions.connectTimeout].
+     */
     public data object ConnectTimeout : MqttError
 
     /** The host name could not be resolved. */
@@ -36,7 +39,8 @@ public sealed interface MqttError {
 
     /**
      * An I/O error. [kind] is a short label without addresses (for example `"read"`, `"write"`, `"connect"`, `"ssl"`
-     * for a TLS error, `"closed"` when the client was closed). [cause] is the original exception for debugging; its
+     * for a TLS error, `"websocket"` for a refused WebSocket upgrade or a WebSocket protocol error, `"closed"` when
+     * the client was closed). [cause] is the original exception for debugging; its
      * text is not part of `toString()`.
      */
     public data class Io(val kind: String, val cause: Throwable?) : MqttError {

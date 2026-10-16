@@ -12,8 +12,8 @@ public sealed interface ConnectionState {
     public data object Idle : ConnectionState
 
     /**
-     * A connection attempt is in progress (TCP or TLS connect, then waiting for CONNACK). [attempt] counts attempts
-     * from 1 after the delay was reset by a stable session.
+     * A connection attempt is in progress (TCP or TLS connect, the WebSocket upgrade when used, then waiting for
+     * CONNACK). [attempt] counts attempts from 1 after the delay was reset by a stable session.
      */
     public data class Connecting(val attempt: Int) : ConnectionState
 
