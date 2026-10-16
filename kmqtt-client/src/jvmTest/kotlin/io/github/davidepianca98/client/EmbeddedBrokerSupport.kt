@@ -399,26 +399,30 @@ internal abstract class BrokerTestBase {
 
     protected fun proxy(port: Int) = track(TcpProxy(TestBroker.HOST, port))
 
-    /** Клиент на `NioActorHost` (TCP); быстрый реконнект 100–500 мс без джиттера, чтобы тесты были короткими. */
+    /** Параметры клиента: быстрый реконнект 100–500 мс без джиттера, чтобы тесты были короткими. */
+    protected fun options(
+        port: Int,
+        version: MQTTVersion = MQTTVersion.MQTT5,
+        tune: (MqttClientOptions) -> MqttClientOptions = { it },
+    ): MqttClientOptions = tune(
+        MqttClientOptions(
+            host = TestBroker.HOST,
+            port = port,
+            version = version,
+            clientId = "t05c-${clientCounter.incrementAndGet()}-${System.nanoTime() % 100_000}",
+            keepAlive = 30.seconds,
+            connectTimeout = 5.seconds,
+            connackTimeout = 5.seconds,
+            reconnect = ReconnectPolicy(initial = 100.milliseconds, max = 500.milliseconds, jitter = 0.0),
+        )
+    )
+
+    /** Клиент на `NioActorHost` (TCP); закрывается в конце теста. */
     protected fun client(
         port: Int,
         version: MQTTVersion = MQTTVersion.MQTT5,
         tune: (MqttClientOptions) -> MqttClientOptions = { it },
-    ): MqttClient {
-        val options = tune(
-            MqttClientOptions(
-                host = TestBroker.HOST,
-                port = port,
-                version = version,
-                clientId = "t05c-${clientCounter.incrementAndGet()}-${System.nanoTime() % 100_000}",
-                keepAlive = 30.seconds,
-                connectTimeout = 5.seconds,
-                connackTimeout = 5.seconds,
-                reconnect = ReconnectPolicy(initial = 100.milliseconds, max = 500.milliseconds, jitter = 0.0),
-            )
-        )
-        return MqttClient(options, NioActorHost()).also { clients += it }
-    }
+    ): MqttClient = MqttClient(options(port, version, tune), NioActorHost()).also { clients += it }
 
     protected fun collect(client: MqttClient, perItemDelayMs: Long = 0) = Collector(client, scope, perItemDelayMs)
 
