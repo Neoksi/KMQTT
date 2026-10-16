@@ -135,7 +135,13 @@ public class TlsTransport(
 
     override fun poll(nowMs: Long) {
         if (phase == Phase.Closed) return
-        inner.poll(nowMs)
+        try {
+            inner.poll(nowMs)
+        } catch (e: Exception) {
+            // Исключение не должно останавливать цикл хоста (например, нехватка дескрипторов при открытии канала)
+            fail(NioTransport.errorOf(e))
+            return
+        }
         pump()
         val deadline = deadlineMs
         if (phase == Phase.Handshaking && deadline != null && nowMs >= deadline) fail(MqttError.ConnectTimeout)

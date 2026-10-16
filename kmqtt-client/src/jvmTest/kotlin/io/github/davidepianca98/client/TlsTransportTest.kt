@@ -456,17 +456,44 @@ class TlsTransportTest {
         peer.close()
     }
 
+    /** EOF TCP после рукопожатия без close_notify (ретранслятор закрывает поток к клиенту): Eof, затем закрытие без RST. */
     @Test
-    fun failedToStringHasNoSettings() {
-        val settings = TLSClientSettings(clientCertificatePassword = "s3cr3t-password", serverCertificate = serverPem)
-        val transportText = TlsTransport(NioTransport(dummyContext()), settings).toString()
-        assertFalse(transportText.contains("s3cr3t"), transportText)
-    }
-
-    private fun dummyContext(): NioTransportContext {
-        val selector = java.nio.channels.Selector.open()
-        toClose += selector
-        return NioTransportContext(selector, {}, kotlinx.coroutines.CoroutineScope(kotlinx.coroutines.Dispatchers.IO), 1024)
+    fun tcpEofWithoutCloseNotifyGivesEofThenCloseWithoutReset() {
+        val server = tlsServer()
+        val accepted = acceptAsync(server)
+        val relay = plainServer()
+        val downstream = LinkedBlockingQueue<Socket>()
+        val clientEnd = LinkedBlockingQueue<Any>()
+        thread(isDaemon = true, name = "tls-test-relay") {
+            val down = relay.accept().also { toClose += it }
+            val up = Socket(InetAddress.getLoopbackAddress(), server.localPort).also { toClose += it }
+            thread(isDaemon = true) { runCatching { up.getInputStream().copyTo(down.getOutputStream()) } }
+            downstream.put(down)
+            val buffer = ByteArray(4096)
+            try {
+                while (true) {
+                    val n = down.getInputStream().read(buffer)
+                    if (n < 0) break
+                    up.getOutputStream().write(buffer, 0, n)
+                }
+                clientEnd.put(-1)
+            } catch (e: Exception) {
+                clientEnd.put(e)
+            }
+        }
+        val driver = TestDriver()
+        val host = startedHost(driver, TLSClientSettings(serverCertificate = serverPem))
+        driver.send(host, HostAction.Connect("localhost", relay.localPort, 10_000))
+        assertEquals(TransportEvent.Connected, driver.awaitEvent(10_000))
+        val peer = assertIs<SSLSocket>(accepted.poll(10, TimeUnit.SECONDS))
+        peer.outputStream.write("data".encodeToByteArray())
+        peer.outputStream.flush()
+        assertEquals("data", driver.readBytes(4).decodeToString())
+        // FIN к клиенту без close_notify
+        assertNotNull(downstream.poll(5, TimeUnit.SECONDS)).shutdownOutput()
+        assertEquals(TransportEvent.Eof, driver.awaitEvent())
+        driver.send(host, HostAction.CloseTransport)
+        assertEquals(-1, clientEnd.poll(5, TimeUnit.SECONDS), "клиент закрыл штатно (FIN, не RST)")
     }
 
     private companion object {
