@@ -649,6 +649,7 @@ class MqttSessionCoreTest {
             assertFalse(text.contains(secret), "SessionSettings.toString не содержит $secret")
         }
         assertFalse(OutgoingPublish("/devices/x", "payload".encodeToByteArray()).toString().contains("/devices"))
+        assertFalse(SubscriptionRequest("/devices/#").toString().contains("/devices"))
 
         val e = assertFailsWith<IllegalArgumentException> {
             SessionSettings(v5, "c", SessionCredentials(null, password.encodeToByteArray()), keepAliveSec = 10)

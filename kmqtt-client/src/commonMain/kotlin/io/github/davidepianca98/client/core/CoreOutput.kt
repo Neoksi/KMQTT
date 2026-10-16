@@ -97,12 +97,14 @@ public class OutgoingPublish(
     override fun toString(): String = "OutgoingPublish(qos=$qos, retain=$retain, size=${payload.size})"
 }
 
-/** Фильтр подписки. */
+/** Фильтр подписки. `toString()` без фильтра (H11: топики вне логов). */
 @MqttCoreApi
 public data class SubscriptionRequest(
     public val filter: String,
     public val qos: Qos = Qos.AT_MOST_ONCE,
-)
+) {
+    override fun toString(): String = "SubscriptionRequest(qos=$qos, length=${filter.length})"
+}
 
 /** Результат [MqttSessionCore.publish]. */
 @MqttCoreApi
