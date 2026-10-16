@@ -11,7 +11,7 @@ import kotlin.time.Duration
  * ([subscriptions]), an offline publish queue with a time-to-live, and an ordered, back-pressured stream of incoming
  * messages ([incoming]).
  *
- * Create it with `MqttClient(options)` on the JVM (this is the only factory that can use TLS) or with
+ * Create it with `MqttClient(options)` on the JVM (this is the only factory that can use TLS and WebSocket) or with
  * `MqttClient(options, host)` on a custom [MqttHost]; see [MqttClientOptions] for the settings.
  *
  * **Threading.** Every method is thread-safe and non-blocking: a call puts a request into an unbounded FIFO queue and
@@ -159,8 +159,9 @@ public interface MqttClient {
  * **Security:** when [MqttClientOptions.tls] is set this factory always throws [IllegalArgumentException] at
  * creation, before the host is started: a host passed from outside is not known to apply TLS (the public
  * `NioActorHost()` speaks plain TCP), and the client never falls back to plain text. Use the JVM factory
- * `MqttClient(options)` for TLS. Invalid options also throw [IllegalArgumentException]; the message contains no
- * addresses or secrets.
+ * `MqttClient(options)` for TLS. The same holds for [MqttClientOptions.webSocket]: a host passed from outside is not
+ * known to speak WebSocket, so `webSocket != null` throws [IllegalArgumentException] too. Invalid options also throw
+ * [IllegalArgumentException]; the message contains no addresses or secrets.
  */
 public fun MqttClient(options: MqttClientOptions, host: MqttHost, clock: MqttClock = MqttClock.Monotonic): MqttClient =
     MqttClientImpl(options, host, clock)

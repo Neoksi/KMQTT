@@ -46,6 +46,8 @@ internal class TestBroker(
     private val maximumQos: Qos? = null,
     private val tlsSettings: TLSSettings? = null,
     private val maximumPacketSize: UInt = DEFAULT_MAX_PACKET,
+    /** Порт WebSocket брокера (`ws://`, с [tlsSettings] — `wss://`); `null` — без WebSocket (SEVEN-248). */
+    val webSocketPort: Int? = null,
 ) : AutoCloseable {
     @Volatile
     private var stopRequested = false
@@ -81,7 +83,8 @@ internal class TestBroker(
                     host = HOST,
                     maximumQos = maximumQos,
                     tlsSettings = tlsSettings,
-                    maximumPacketSize = maximumPacketSize
+                    maximumPacketSize = maximumPacketSize,
+                    webSocketPort = webSocketPort
                 )
             } catch (e: Exception) {
                 if (System.currentTimeMillis() > deadline) throw e
@@ -456,7 +459,15 @@ internal abstract class BrokerTestBase {
         maximumQos: Qos? = null,
         tlsSettings: TLSSettings? = null,
         maximumPacketSize: UInt = TestBroker.DEFAULT_MAX_PACKET,
-    ) = track(TestBroker(maximumQos = maximumQos, tlsSettings = tlsSettings, maximumPacketSize = maximumPacketSize))
+        webSocket: Boolean = false,
+    ) = track(
+        TestBroker(
+            maximumQos = maximumQos,
+            tlsSettings = tlsSettings,
+            maximumPacketSize = maximumPacketSize,
+            webSocketPort = if (webSocket) TestBroker.freePort() else null
+        )
+    )
 
     protected fun proxy(port: Int) = track(TcpProxy(TestBroker.HOST, port))
 

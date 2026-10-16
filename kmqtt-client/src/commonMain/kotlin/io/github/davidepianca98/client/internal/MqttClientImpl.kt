@@ -59,6 +59,7 @@ private val temporaryCounter = atomic(0L)
  * Безопасность (решение владельца 2026-10-16, S06b-T05b): при `config.tls != null` клиент создаётся только с хостом,
  * который сам применяет TLS ([hostAppliesTls] — его ставит jvm-фабрика `MqttClient(options)`); иначе — отказ
  * `IllegalArgumentException` при создании, до запуска хоста: никогда не подключаться открытым текстом.
+ * То же для `config.webSocket != null` ([hostAppliesWebSocket], SEVEN-248): WebSocket применяет только хост jvm-фабрики.
  * Так же при создании отказывает комбинация `tls.checkServerCertificate = false` и `verifyHostname = true`
  * ([TRUST_ALL_NEEDS_NO_HOSTNAME], SEVEN-258): проверка в одном месте, через которое проходит любая фабрика.
  *
@@ -73,12 +74,15 @@ internal class MqttClientImpl(
     private val host: MqttHost,
     @Suppress("unused") private val clock: MqttClock,
     hostAppliesTls: Boolean = false,
+    hostAppliesWebSocket: Boolean = false,
 ) : MqttClient, HostDriver {
     init {
         require(config.tls == null || hostAppliesTls) { TLS_HOST_REQUIRED }
         // Решение владельца 2026-10-16 (SEVEN-258, D4 ревью G1): «доверять всем» не проверяет имя хоста — это
         // должно быть сказано явно (`verifyHostname = false`), а не молча при умолчании `true`
         require(config.tls?.checkServerCertificate != false || !config.verifyHostname) { TRUST_ALL_NEEDS_NO_HOSTNAME }
+        // SEVEN-248: чужой хост не обязан говорить WebSocket — MQTT напрямую в WebSocket-порт молча не работал бы
+        require(config.webSocket == null || hostAppliesWebSocket) { WEBSOCKET_HOST_REQUIRED }
     }
 
     private val engine = MqttClientEngine(config.toEngineOptions(), nextEpoch = { epochCounter.incrementAndGet() })
@@ -519,6 +523,10 @@ internal class MqttClientImpl(
         /** Текст отказа при `tls != null` и хосте без TLS (без адресов и секретов). */
         const val TLS_HOST_REQUIRED: String =
             "MqttClientOptions.tls is set, but the host does not apply TLS: use MqttClient(options) on JVM"
+
+        /** Текст отказа при `webSocket != null` и хосте без WebSocket (без адресов и секретов, SEVEN-248). */
+        const val WEBSOCKET_HOST_REQUIRED: String =
+            "MqttClientOptions.webSocket is set, but the host does not apply WebSocket: use MqttClient(options) on JVM"
 
         /** Текст отказа при `tls.checkServerCertificate = false` и `verifyHostname = true` (без адресов и секретов). */
         const val TRUST_ALL_NEEDS_NO_HOSTNAME: String =

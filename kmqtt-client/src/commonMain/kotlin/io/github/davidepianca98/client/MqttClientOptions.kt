@@ -29,7 +29,8 @@ import kotlin.time.Duration.Companion.seconds
  * @param version MQTT protocol version.
  * @param credentials user name and password sent in CONNECT; `null` for anonymous access (pass `null`, not an empty
  *   user name).
- * @param tls TLS settings; `null` means plain TCP. TLS is applied by the host the client is created with: the JVM
+ * @param tls TLS settings; `null` means plain TCP (or `ws://` with [webSocket]). With [webSocket] it makes the
+ *   connection `wss://`. TLS is applied by the host the client is created with: the JVM
  *   factory `MqttClient(options)` builds a TLS host; the common factory `MqttClient(options, host, clock)` refuses
  *   options with `tls != null` ([IllegalArgumentException]), so a client with `tls` never connects in plain text.
  *   ALPN protocols and an explicit SNI name come from [TLSClientSettings.alpnProtocols] and
@@ -81,6 +82,11 @@ import kotlin.time.Duration.Companion.seconds
  *   broker keeps the session after the connection is lost, at least 1 second ([Duration.INFINITE]: never expires;
  *   values above 4294967295 seconds are sent as "never"). Not used with MQTT 3.1.1, where the broker decides how long
  *   it keeps a session, nor without [persistentSession].
+ * @param webSocket MQTT over WebSocket ([MqttWebSocket]: request path and extra headers); `null` (the default) means
+ *   MQTT directly over TCP or TLS. With [tls] the connection is `wss://` (the same certificate and [verifyHostname]
+ *   rules as plain TLS), without it `ws://`. Like TLS it is applied only by the JVM factory `MqttClient(options)`; the
+ *   common factory `MqttClient(options, host, clock)` refuses options with `webSocket != null`
+ *   ([IllegalArgumentException]). The resulting transport is [transport].
  */
 public data class MqttClientOptions(
     val host: String,
@@ -101,7 +107,17 @@ public data class MqttClientOptions(
     val logger: MqttLogger = MqttLogger.None,
     val persistentSession: Boolean = false,
     val sessionExpiry: Duration = 10.minutes,
+    val webSocket: MqttWebSocket? = null,
 ) {
+    /** Transport chosen by [tls] and [webSocket]: TCP, TLS, `ws://` or `wss://`. */
+    public val transport: MqttTransportKind
+        get() = when {
+            webSocket == null && tls == null -> MqttTransportKind.Tcp
+            webSocket == null -> MqttTransportKind.Tls
+            tls == null -> MqttTransportKind.WebSocket
+            else -> MqttTransportKind.SecureWebSocket
+        }
+
     init {
         require(host.isNotBlank()) { "host is blank" }
         require(port in 1..65_535) { "port out of 1..65535" }
@@ -121,7 +137,7 @@ public data class MqttClientOptions(
             "verifyHostname=$verifyHostname, clientId=${if (clientId == null) "random" else "set"}, keepAlive=$keepAlive, " +
             "connectTimeout=$connectTimeout, connackTimeout=$connackTimeout, closeLinger=$closeLinger, will=$will, " +
             "reconnect=$reconnect, offlineQueue=$offlineQueue, limits=$limits, persistentSession=$persistentSession, " +
-            "sessionExpiry=$sessionExpiry)"
+            "sessionExpiry=$sessionExpiry, transport=$transport)"
 }
 
 /**
