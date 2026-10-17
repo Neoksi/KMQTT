@@ -130,6 +130,19 @@ public sealed interface EngineCommand {
      * EOF брокера (не дольше `closeLingerMs`), закрытие транспорта, `Closed(null)`.
      */
     public data class Close(val reason: ReasonCode = ReasonCode.SUCCESS) : EngineCommand
+
+    /**
+     * Ответ на [EngineAction.AuthChallenge] подключения [connection] (SEVEN-249): [failed] = `false` — AUTH 0x18 с [data]
+     * (`null` — без Authentication Data), `true` — отказ клиента (DISCONNECT 0x87, `Refused(NOT_AUTHORIZED)`). Ответ
+     * другому (прошлому) подключению или вне ожидания отбрасывается. `toString()` без данных (H11).
+     */
+    public class AuthResponse(
+        public val connection: Long,
+        public val data: ByteArray?,
+        public val failed: Boolean = false,
+    ) : EngineCommand {
+        override fun toString(): String = "AuthResponse(connection=$connection, size=${data?.size ?: -1}, failed=$failed)"
+    }
 }
 
 /** Действие движка. Исполняются по порядку; I/O-часть фасад переводит в `HostAction`. */
@@ -138,6 +151,14 @@ public sealed interface EngineAction {
     /** Подключить транспорт (прежний закрывается). Результат — `TransportEvent.Connected`/`Failed`. */
     public class Connect(public val host: String, public val port: Int, public val timeoutMs: Long) : EngineAction {
         override fun toString(): String = "Connect(timeoutMs=$timeoutMs)"
+    }
+
+    /**
+     * Брокер продолжает расширенную аутентификацию (SEVEN-249): вычислить ответ на [data] вне потока хоста и вернуть его
+     * командой [EngineCommand.AuthResponse] с тем же [connection] (номер подключения транспорта). `toString()` без данных.
+     */
+    public class AuthChallenge(public val connection: Long, public val method: String, public val data: ByteArray?) : EngineAction {
+        override fun toString(): String = "AuthChallenge(connection=$connection, method=$method, size=${data?.size ?: -1})"
     }
 
     /** Записать байты в текущий транспорт. */

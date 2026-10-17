@@ -10,7 +10,11 @@ import io.github.davidepianca98.mqtt.packets.mqttv5.ReasonCode
  * are reported without the address or the names in the certificate.
  */
 public sealed interface MqttError {
-    /** The broker answered CONNECT with a failure code (with MQTT 3.1.1 the return code translated to [ReasonCode]). */
+    /**
+     * The broker answered CONNECT with a failure code (with MQTT 3.1.1 the return code translated to [ReasonCode]).
+     * With [MqttClientOptions.enhancedAuth] also the refusal of the client itself: the provider threw or did not answer
+     * within the CONNACK timeout ([ReasonCode.NOT_AUTHORIZED]; see [MqttEnhancedAuth]).
+     */
     public data class Refused(val code: ReasonCode) : MqttError
 
     /**

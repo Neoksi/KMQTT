@@ -88,6 +88,9 @@ import kotlin.time.Duration.Companion.seconds
  *   rules as plain TLS), without it `ws://`. Like TLS it is applied only by the JVM factory `MqttClient(options)`; the
  *   common factory `MqttClient(options, host, clock)` refuses options with `webSocket != null`
  *   ([IllegalArgumentException]). The resulting transport is [transport].
+ * @param enhancedAuth MQTT 5 enhanced authentication (AUTH packets, see [MqttEnhancedAuth]); `null` (the default) for
+ *   none. It can be combined with [credentials] and works the same over every [transport]. With MQTT 3.1.1 it is
+ *   rejected ([IllegalArgumentException]): that protocol has no AUTH packet.
  */
 public data class MqttClientOptions(
     val host: String,
@@ -109,6 +112,7 @@ public data class MqttClientOptions(
     val persistentSession: Boolean = false,
     val sessionExpiry: Duration = 10.minutes,
     val webSocket: MqttWebSocket? = null,
+    val enhancedAuth: MqttEnhancedAuth? = null,
 ) {
     /** Transport chosen by [tls] and [webSocket]: TCP, TLS, `ws://` or `wss://`. */
     public val transport: MqttTransportKind
@@ -131,6 +135,7 @@ public data class MqttClientOptions(
         require(!persistentSession || !clientId.isNullOrBlank()) { "persistentSession needs an explicit clientId" }
         require(!persistentSession || sessionExpiry >= 1.seconds) { "sessionExpiry < 1 s with persistentSession" }
         require(!sessionExpiry.isNegative()) { "sessionExpiry < 0" }
+        require(enhancedAuth == null || version == MQTTVersion.MQTT5) { "enhancedAuth needs MQTT 5" }
     }
 
     override fun toString(): String =
@@ -138,7 +143,7 @@ public data class MqttClientOptions(
             "verifyHostname=$verifyHostname, clientId=${if (clientId == null) "random" else "set"}, keepAlive=$keepAlive, " +
             "connectTimeout=$connectTimeout, connackTimeout=$connackTimeout, closeLinger=$closeLinger, will=$will, " +
             "reconnect=$reconnect, offlineQueue=$offlineQueue, limits=$limits, persistentSession=$persistentSession, " +
-            "sessionExpiry=$sessionExpiry, transport=$transport)"
+            "sessionExpiry=$sessionExpiry, transport=$transport, enhancedAuth=$enhancedAuth)"
 }
 
 /**

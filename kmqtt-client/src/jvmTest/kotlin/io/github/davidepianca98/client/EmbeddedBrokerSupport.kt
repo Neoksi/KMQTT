@@ -3,6 +3,7 @@ package io.github.davidepianca98.client
 import io.github.davidepianca98.client.core.BrokerScript
 import io.github.davidepianca98.mqtt.MQTTVersion
 import io.github.davidepianca98.mqtt.broker.Broker
+import io.github.davidepianca98.mqtt.broker.interfaces.EnhancedAuthenticationProvider
 import io.github.davidepianca98.mqtt.packets.Qos
 import io.github.davidepianca98.socket.tls.TLSSettings
 import kotlinx.coroutines.CoroutineScope
@@ -48,6 +49,8 @@ internal class TestBroker(
     private val maximumPacketSize: UInt = DEFAULT_MAX_PACKET,
     /** Порт WebSocket брокера (`ws://`, с [tlsSettings] — `wss://`); `null` — без WebSocket (SEVEN-248). */
     val webSocketPort: Int? = null,
+    /** Провайдеры расширенной аутентификации MQTT 5 по методу (SEVEN-249). */
+    private val enhancedAuth: Map<String, EnhancedAuthenticationProvider> = emptyMap(),
 ) : AutoCloseable {
     @Volatile
     private var stopRequested = false
@@ -84,7 +87,8 @@ internal class TestBroker(
                     maximumQos = maximumQos,
                     tlsSettings = tlsSettings,
                     maximumPacketSize = maximumPacketSize,
-                    webSocketPort = webSocketPort
+                    webSocketPort = webSocketPort,
+                    enhancedAuthenticationProviders = enhancedAuth,
                 )
             } catch (e: Exception) {
                 if (System.currentTimeMillis() > deadline) throw e
@@ -460,12 +464,14 @@ internal abstract class BrokerTestBase {
         tlsSettings: TLSSettings? = null,
         maximumPacketSize: UInt = TestBroker.DEFAULT_MAX_PACKET,
         webSocket: Boolean = false,
+        enhancedAuth: Map<String, EnhancedAuthenticationProvider> = emptyMap(),
     ) = track(
         TestBroker(
             maximumQos = maximumQos,
             tlsSettings = tlsSettings,
             maximumPacketSize = maximumPacketSize,
-            webSocketPort = if (webSocket) TestBroker.freePort() else null
+            webSocketPort = if (webSocket) TestBroker.freePort() else null,
+            enhancedAuth = enhancedAuth,
         )
     )
 

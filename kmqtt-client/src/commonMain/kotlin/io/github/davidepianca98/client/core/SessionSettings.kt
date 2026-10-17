@@ -32,6 +32,26 @@ public class WillSpec(
 }
 
 /**
+ * Расширенная аутентификация MQTT 5 (пакеты AUTH, MQTT 5 §4.12, SEVEN-249): [method] уходит в CONNECT свойством
+ * Authentication Method, [initialData] вызывается на **каждое** подключение (CONNECT строится заново, например со свежим
+ * nonce SCRAM) и уходит свойством Authentication Data (`null` — без него). Вызывается на потоке хоста: быстро, без
+ * блокировок; исключение — подключение кончается `Closed(Refused(NOT_AUTHORIZED))` без CONNECT. Ответы на вызовы брокера
+ * ядро не вычисляет: выдаёт [CoreOutput.AuthChallenge] и ждёт [MqttSessionCore.authResponse]. `toString()` печатает
+ * только метод (H11: данные — секрет).
+ */
+@MqttCoreApi
+public class SessionAuth(
+    public val method: String,
+    public val initialData: () -> ByteArray? = { null },
+) {
+    init {
+        require(method.isNotEmpty()) { "authentication method is empty" }
+    }
+
+    override fun toString(): String = "SessionAuth(method=$method)"
+}
+
+/**
  * Параметры одного подключения для [MqttSessionCore]. Проверки — при создании (`IllegalArgumentException`, текст без
  * логина, пароля и топиков), как в `MQTTClient.kt:176-191`.
  *
@@ -54,6 +74,8 @@ public class WillSpec(
  * @param topicAliasMaximum Topic Alias Maximum клиента (MQTT 5). По умолчанию 0 — не объявляется, и брокер не вправе
  *   присылать алиасы. Решение SEVEN-222: приложению алиасы не нужны, а PUBLISH, отброшенный фреймером как
  *   `TopicTooLong`, мог задавать алиас — сопоставление теряется (см. [MqttSessionCore]).
+ * @param auth расширенная аутентификация (только MQTT 5; для 3.1.1 — `IllegalArgumentException`: пакета AUTH там нет);
+ *   `null` — нет. Весь обмен до CONNACK ограничен [connackTimeoutMs] от CONNECT.
  */
 @MqttCoreApi
 public class SessionSettings(
@@ -70,6 +92,7 @@ public class SessionSettings(
     public val receiveMaximum: Int = 65_535,
     public val topicAliasMaximum: Int = 0,
     public val sessionExpiryIntervalSec: Long? = null,
+    public val auth: SessionAuth? = null,
 ) {
     init {
         require(keepAliveSec in 0..65_535) { "Keep alive exceeding the maximum value" }
@@ -87,6 +110,7 @@ public class SessionSettings(
         require(sessionExpiryIntervalSec == null || sessionExpiryIntervalSec in 0..MAX_SESSION_EXPIRY) {
             "sessionExpiryIntervalSec out of 0..4294967295"
         }
+        require(auth == null || version == MQTTVersion.MQTT5) { "enhanced authentication needs MQTT 5" }
     }
 
     override fun toString(): String =
@@ -94,7 +118,7 @@ public class SessionSettings(
             "credentials=$credentials, keepAliveSec=$keepAliveSec, cleanStart=$cleanStart, will=$will, " +
             "connackTimeoutMs=$connackTimeoutMs, closeLingerMs=$closeLingerMs, maxIncomingPacket=$maxIncomingPacket, " +
             "maxTopicLength=$maxTopicLength, receiveMaximum=$receiveMaximum, topicAliasMaximum=$topicAliasMaximum, " +
-            "sessionExpiryIntervalSec=$sessionExpiryIntervalSec)"
+            "sessionExpiryIntervalSec=$sessionExpiryIntervalSec, auth=$auth)"
 
     public companion object {
         /** Наибольший Session Expiry Interval MQTT 5 (4294967295 с — «не истекает»). */

@@ -6,6 +6,7 @@ import io.github.davidepianca98.client.PublishResult
 import io.github.davidepianca98.client.SubscribeRefused
 import io.github.davidepianca98.client.TopicState
 import io.github.davidepianca98.client.core.MqttCoreApi
+import io.github.davidepianca98.client.core.SessionAuth
 import io.github.davidepianca98.client.core.SessionCredentials
 import io.github.davidepianca98.client.core.SessionSettings
 import io.github.davidepianca98.client.core.WillSpec
@@ -51,6 +52,7 @@ internal fun MqttClientOptions.toEngineOptions(): EngineOptions = EngineOptions(
         maxTopicLength = limits.maxTopicLength,
         cleanStart = !persistentSession,
         sessionExpiryIntervalSec = if (persistentSession && version == MQTTVersion.MQTT5) sessionExpirySeconds() else null,
+        auth = enhancedAuth?.let { SessionAuth(it.method, it.initialData) },
     ),
     connectTimeoutMs = connectTimeout.inWholeMilliseconds,
     reconnect = reconnect,

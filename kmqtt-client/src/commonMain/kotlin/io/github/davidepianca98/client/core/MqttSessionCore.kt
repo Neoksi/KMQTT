@@ -86,7 +86,18 @@ import io.github.davidepianca98.mqtt.packets.mqttv5.SubscriptionOptions
  * - Ошибка протокола (в т. ч. от фреймера) → в MQTT 5 в исходящие кладётся DISCONNECT с кодом ошибки (will брокер
  *   опубликует: код ≠ 0), в 3.1.1 — ничего (DISCONNECT 3.1.1 отменил бы will); затем `Closed(Protocol(code))`.
  * - DISCONNECT брокера (любой код) → `Closed(ServerDisconnect(code))`; в 3.1.1 (брокер его не шлёт) — код `SUCCESS`.
- * - Входящий AUTH → `Closed(Protocol(PROTOCOL_ERROR))`: расширенная аутентификация не переносится (нецель).
+ * - Расширенная аутентификация MQTT 5 (SEVEN-249, [SessionSettings.auth]): CONNECT несёт Authentication Method и
+ *   Authentication Data ([SessionAuth.initialData], вызывается в [start]). Входящий AUTH 0x18 (CONTINUE_AUTHENTICATION)
+ *   с тем же методом до CONNACK → [CoreOutput.AuthChallenge]; ответ хоста — [authResponse] (AUTH 0x18 с методом и
+ *   данными) или [authFailed]. Обмен многошаговый, завершается CONNACK: успех — метод в CONNACK обязан совпасть с
+ *   настроенным (иначе `Protocol(PROTOCOL_ERROR)`, MQTT 5 §4.12 [MQTT-4.12.0-5]); отказ брокера (0x87 NOT_AUTHORIZED,
+ *   0x8C BAD_AUTHENTICATION_METHOD и др.) → `Closed(Refused(code))`. Срок всего обмена — `connackTimeoutMs` от CONNECT:
+ *   брокер молчит → `Closed(ConnackTimeout)`; не ответил сам клиент (вызов ждёт [authResponse]) → DISCONNECT 0x87 и
+ *   `Closed(Refused(NOT_AUTHORIZED))`, как и при [authFailed] (MQTT 5 §4.12 разрешает DISCONNECT до CONNACK). Нарушения
+ *   → `Protocol(PROTOCOL_ERROR)`: AUTH без настроенного метода, с другим методом, с кодом SUCCESS/RE_AUTHENTICATE, второй
+ *   AUTH до ответа клиента, AUTH после CONNACK (повторная аутентификация 0x19 не поддерживается). В 3.1.1 AUTH нет:
+ *   [SessionSettings] с `auth` не создаётся, входящий AUTH — ошибка протокола (фреймер). Данные проверки CONNACK
+ *   (Authentication Data успешного CONNACK, например server-final SCRAM) ядро не проверяет и не выдаёт.
  *
  * Отличия от `MQTTClient` (сознательные):
  * - Проверки `requestProblemInformation == 0` не переносятся: ядро это свойство не отправляет (по умолчанию 1),
@@ -139,6 +150,9 @@ public class MqttSessionCore(private val settings: SessionSettings, nowMs: Long)
     private val topicAliases = HashMap<Int, String>()
     private var aliasesLost = false
 
+    // Расширенная аутентификация (SEVEN-249): выдан AuthChallenge, ждём authResponse/authFailed
+    private var authAwaitingResponse = false
+
     /** Отправляет CONNECT. Вызывается один раз, когда транспорт подключён. */
     public fun start(nowMs: Long): List<CoreOutput> {
         check(!started) { "start() already called" }
@@ -146,7 +160,15 @@ public class MqttSessionCore(private val settings: SessionSettings, nowMs: Long)
         if (state != CoreState.Connecting) return emptyList()
         connackDeadline = nowMs + settings.connackTimeoutMs
         lastReceivedMs = nowMs
-        enqueue(buildConnect(), nowMs)
+        val authData = settings.auth?.let { auth ->
+            try {
+                auth.initialData()
+            } catch (_: Exception) {
+                // Текст исключения может содержать секрет — не сохраняется (H11)
+                return closeWith(MqttError.Refused(ReasonCode.NOT_AUTHORIZED))
+            }
+        }
+        enqueue(buildConnect(authData), nowMs)
         return emptyList()
     }
 
@@ -184,6 +206,29 @@ public class MqttSessionCore(private val settings: SessionSettings, nowMs: Long)
         CoreState.Closed -> emptyList()
         CoreState.Closing -> closeWith(null)
         CoreState.Connecting, CoreState.Connected -> closeWith(MqttError.Io("eof", null))
+    }
+
+    /**
+     * Ответ на [CoreOutput.AuthChallenge]: AUTH 0x18 (CONTINUE_AUTHENTICATION) с методом [SessionAuth.method] и
+     * Authentication Data [data] (`null` — без неё). Вне ожидания ответа (вызов уже отвечен, CONNACK пришёл, подключение
+     * кончилось) — ничего: поздний ответ прошлого вызова отбрасывается.
+     */
+    public fun authResponse(data: ByteArray?, nowMs: Long): List<CoreOutput> {
+        if (state != CoreState.Connecting || !authAwaitingResponse) return emptyList()
+        val auth = settings.auth ?: return emptyList()
+        authAwaitingResponse = false
+        val properties = MQTT5Properties(authenticationMethod = auth.method, authenticationData = data?.asUByteArray())
+        enqueue(MQTT5Auth(ReasonCode.CONTINUE_AUTHENTICATION, properties).toByteArray().asByteArray(), nowMs)
+        return emptyList()
+    }
+
+    /**
+     * Клиент не может ответить на [CoreOutput.AuthChallenge] (провайдер отказал или упал): DISCONNECT 0x87 и
+     * `Closed(Refused(NOT_AUTHORIZED))`. Вне ожидания ответа — ничего.
+     */
+    public fun authFailed(nowMs: Long): List<CoreOutput> {
+        if (state != CoreState.Connecting || !authAwaitingResponse) return emptyList()
+        return failAuth(nowMs)
     }
 
     /**
@@ -350,7 +395,10 @@ public class MqttSessionCore(private val settings: SessionSettings, nowMs: Long)
         when (state) {
             CoreState.Closed -> return emptyList()
             CoreState.Connecting -> {
-                if (started && nowMs >= connackDeadline) return closeWith(MqttError.ConnackTimeout)
+                if (started && nowMs >= connackDeadline) {
+                    // Срок вышел, пока ответа ждали от самого клиента (SEVEN-249): это его отказ, а не молчание брокера
+                    return if (authAwaitingResponse) failAuth(nowMs) else closeWith(MqttError.ConnackTimeout)
+                }
                 return emptyList()
             }
             CoreState.Closing -> return if (nowMs >= lingerDeadline) closeWith(null) else emptyList()
@@ -435,6 +483,10 @@ public class MqttSessionCore(private val settings: SessionSettings, nowMs: Long)
             handleConnack(packet, out)
             return
         }
+        if (packet is MQTT5Auth) {
+            handleAuth(packet, out)
+            return
+        }
         if (state != CoreState.Connected) throw MQTTException(ReasonCode.PROTOCOL_ERROR)
         when (packet) {
             is MQTTPuback -> {
@@ -499,13 +551,25 @@ public class MqttSessionCore(private val settings: SessionSettings, nowMs: Long)
                 val code = (packet as? MQTT5Disconnect)?.reasonCode ?: ReasonCode.SUCCESS
                 out += closeWith(MqttError.ServerDisconnect(code))
             }
-            is MQTT5Auth -> throw MQTTException(ReasonCode.PROTOCOL_ERROR)
             else -> throw MQTTException(ReasonCode.PROTOCOL_ERROR)
         }
     }
 
+    /** AUTH брокера (SEVEN-249): только 0x18 с настроенным методом, до CONNACK и не во время ожидания ответа клиента. */
+    private fun handleAuth(packet: MQTT5Auth, out: MutableList<CoreOutput>) {
+        val auth = settings.auth ?: throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+        if (state != CoreState.Connecting || authAwaitingResponse) throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+        if (packet.authenticateReasonCode != ReasonCode.CONTINUE_AUTHENTICATION) {
+            throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+        }
+        if (packet.properties.authenticationMethod != auth.method) throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+        authAwaitingResponse = true
+        out += CoreOutput.AuthChallenge(auth.method, packet.properties.authenticationData?.asByteArray())
+    }
+
     private fun handleConnack(packet: MQTTConnack, out: MutableList<CoreOutput>) {
         if (state != CoreState.Connecting) throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+        authAwaitingResponse = false
         val info: ConnackInfo
         when (packet) {
             is MQTT5Connack -> {
@@ -515,6 +579,11 @@ public class MqttSessionCore(private val settings: SessionSettings, nowMs: Long)
                     return
                 }
                 val props = packet.properties
+                // MQTT 5 §4.12 [MQTT-4.12.0-5]: успешный CONNACK несёт тот же Authentication Method, что CONNECT
+                val auth = settings.auth
+                if (auth != null && props.authenticationMethod != auth.method) {
+                    throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+                }
                 val receiveMaximum = props.receiveMaximum?.toLong() ?: 65_535L
                 if (receiveMaximum == 0L) throw MQTTException(ReasonCode.PROTOCOL_ERROR)
                 val maximumQos = props.maximumQos?.let {
@@ -629,7 +698,7 @@ public class MqttSessionCore(private val settings: SessionSettings, nowMs: Long)
 
     // ---- служебное ----
 
-    private fun buildConnect(): ByteArray {
+    private fun buildConnect(authData: ByteArray?): ByteArray {
         val will = settings.will
         val credentials = settings.credentials
         val login = credentials?.login
@@ -650,6 +719,8 @@ public class MqttSessionCore(private val settings: SessionSettings, nowMs: Long)
                 maximumPacketSize = settings.maxIncomingPacket.toUInt(),
                 receiveMaximum = settings.receiveMaximum.takeIf { it != 65_535 }?.toUInt(),
                 topicAliasMaximum = settings.topicAliasMaximum.takeIf { it > 0 }?.toUInt(),
+                authenticationMethod = settings.auth?.method,
+                authenticationData = authData?.asUByteArray(),
             )
             MQTT5Connect(
                 "MQTT",
@@ -696,6 +767,14 @@ public class MqttSessionCore(private val settings: SessionSettings, nowMs: Long)
             if (id !in pendingAck && id !in pendingPubcomp && id !in pendingSubscriptions && id !in reserved) return id
         }
         throw IllegalStateException("no free packet identifier")
+    }
+
+    /** Отказ клиента в расширенной аутентификации: DISCONNECT 0x87 (кладётся после перехода) и `Refused(NOT_AUTHORIZED)`. */
+    private fun failAuth(nowMs: Long): List<CoreOutput> {
+        authAwaitingResponse = false
+        val closed = closeWith(MqttError.Refused(ReasonCode.NOT_AUTHORIZED))
+        enqueue(MQTT5Disconnect(ReasonCode.NOT_AUTHORIZED).toByteArray().asByteArray(), nowMs)
+        return closed
     }
 
     private fun failProtocol(code: ReasonCode, nowMs: Long, out: MutableList<CoreOutput>) {

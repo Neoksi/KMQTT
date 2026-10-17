@@ -63,6 +63,10 @@ import kotlin.time.Duration.Companion.milliseconds
  *   DISCONNECT, ожидание EOF брокера (или дедлайна `closeLingerMs` ядра), `CloseTransport`, `State(Closed(null))`.
  *   Неотправленные публикации и ждущие PUBACK → `Failed(Closed)`. Без живой сессии — закрытие сразу.
  *
+ * Расширенная аутентификация MQTT 5 (SEVEN-249, `session.auth`): вызов брокера ([CoreOutput.AuthChallenge]) выдаётся
+ * [EngineAction.AuthChallenge] с номером подключения; ответ — [EngineCommand.AuthResponse] с тем же номером. Ответ
+ * прошлому подключению (обрыв и новое подключение, пока провайдер думал) ядру нового подключения не передаётся.
+ *
  * Подписки — [SubscriptionSet] (S06b-T03b): группы и их разница в живой сессии, весь набор после CONNACK, состояние
  * фильтров ([EngineAction.TopicStates]), отказы SUBACK без разрыва ([EngineAction.SubscriptionRefused], H7),
  * [EngineCommand.Resubscribe], предел [EngineOptions.maxFilters]; стабильность сессии — его счётчик SUBACK.
@@ -91,6 +95,7 @@ public class MqttClientEngine(
 
     // Текущее подключение
     private var core: MqttSessionCore? = null
+    private var connectionSeq = 0L // номер подключения транспорта (растёт на каждое ядро): для AuthResponse
     private var epoch: Long? = null
     private var connectedAt: Long? = null
     private val awaitingAck = HashMap<Int, EngineCommand.Publish>()
@@ -145,6 +150,7 @@ public class MqttClientEngine(
             is EngineCommand.Resubscribe -> resubscribe(command.group, nowMs)
             is EngineCommand.SetReadPaused -> setReadPaused(command.paused, nowMs)
             is EngineCommand.Close -> close(command.reason, nowMs)
+            is EngineCommand.AuthResponse -> authResponse(command, nowMs)
         }
         flush()
     }
@@ -155,6 +161,7 @@ public class MqttClientEngine(
             TransportEvent.Connected -> if (core == null && phase == Phase.Connecting) {
                 val created = coreFactory(options.session, nowMs)
                 core = created
+                connectionSeq++
                 if (readPaused) created.setReadPaused(true, nowMs)
                 handle(created, created.start(nowMs), nowMs)
             }
@@ -210,6 +217,8 @@ public class MqttClientEngine(
                 is CoreOutput.SubAck -> subscriptions.onSubAck(output.packetId, output.codes)
                 is CoreOutput.UnsubAck -> Unit
                 is CoreOutput.Dropped -> actions += EngineAction.Log(EngineLogEvent.Dropped(output.reason))
+                is CoreOutput.AuthChallenge ->
+                    actions += EngineAction.AuthChallenge(connectionSeq, output.method, output.data)
                 is CoreOutput.Closed -> {
                     // Штатное закрытие оставляет DISCONNECT в исходящих; при ошибке там может быть DISCONNECT(code) MQTT 5
                     flush(lost = output.error != null)
@@ -218,6 +227,13 @@ public class MqttClientEngine(
                 }
             }
         }
+    }
+
+    private fun authResponse(command: EngineCommand.AuthResponse, nowMs: Long) {
+        val current = core ?: return
+        if (command.connection != connectionSeq || phase != Phase.Connecting) return
+        val outputs = if (command.failed) current.authFailed(nowMs) else current.authResponse(command.data, nowMs)
+        handle(current, outputs, nowMs)
     }
 
     private fun onConnack(connack: ConnackInfo, nowMs: Long) {

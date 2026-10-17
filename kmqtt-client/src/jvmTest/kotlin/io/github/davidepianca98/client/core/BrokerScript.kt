@@ -123,8 +123,12 @@ internal class BrokerScript(
     fun disconnect5(code: ReasonCode, serverReference: String? = null): ByteArray =
         MQTT5Disconnect(code, MQTT5Properties(serverReference = serverReference)).bytes()
 
-    fun auth5(): ByteArray =
-        MQTT5Auth(ReasonCode.CONTINUE_AUTHENTICATION, MQTT5Properties(authenticationMethod = "m")).bytes()
+    fun auth5(
+        code: ReasonCode = ReasonCode.CONTINUE_AUTHENTICATION,
+        method: String = "m",
+        data: ByteArray? = null,
+    ): ByteArray =
+        MQTT5Auth(code, MQTT5Properties(authenticationMethod = method, authenticationData = data?.asUByteArray())).bytes()
 
     private fun MQTTPacket.bytes(): ByteArray = toByteArray().asByteArray()
 }

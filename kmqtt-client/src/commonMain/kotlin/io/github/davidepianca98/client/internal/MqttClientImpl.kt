@@ -32,6 +32,14 @@ import kotlinx.atomicfu.locks.reentrantLock
 import kotlinx.atomicfu.locks.withLock
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
@@ -40,6 +48,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.coroutines.CoroutineContext
 import kotlin.time.Duration
 
 private val epochCounter = atomic(0L)
@@ -63,6 +72,13 @@ private val temporaryCounter = atomic(0L)
  * Так же при создании отказывает комбинация `tls.checkServerCertificate = false` и `verifyHostname = true`
  * ([TRUST_ALL_NEEDS_NO_HOSTNAME], SEVEN-258): проверка в одном месте, через которое проходит любая фабрика.
  *
+ * Расширенная аутентификация (SEVEN-249, `config.enhancedAuth`): `EngineAction.AuthChallenge` запускает
+ * `MqttEnhancedAuth.respond` в корутине на [authContext] (не на потоке хоста: провайдер — `suspend`, может ходить в сеть
+ * или к хранилищу ключей); ответ возвращается запросом `EngineCommand.AuthResponse` через ту же очередь (будит хост).
+ * Исключение провайдера → отказ (`failed = true`), его текст нигде не сохраняется (H11). Новый вызов, `Connect` и
+ * `CloseTransport` отменяют ещё не ответившего провайдера; позднее завершение прошлого подключения движок отбрасывает
+ * по номеру подключения. Область провайдеров отменяется при завершении клиента.
+ *
  * `MqttLogger.packet` (SEVEN-258, W6 §4.8) — здесь, а не в ядре: исходящие — по каждому `HostAction.Write` (ядро
  * склеивает в нём целые пакеты, границы совпадают с началом записи), входящие — по потоку `TransportEvent.Bytes` того
  * подключения, которое кормит ядро ([PacketScanner], сброс на каждый `Connect`/`Connected`). С [MqttLogger.None] не
@@ -75,6 +91,7 @@ internal class MqttClientImpl(
     @Suppress("unused") private val clock: MqttClock,
     hostAppliesTls: Boolean = false,
     hostAppliesWebSocket: Boolean = false,
+    authContext: CoroutineContext = Dispatchers.Default,
 ) : MqttClient, HostDriver {
     init {
         require(config.tls == null || hostAppliesTls) { TLS_HOST_REQUIRED }
@@ -123,6 +140,10 @@ internal class MqttClientImpl(
     private var wroteThisStep = false
     private var rejectedGroup: String? = null
     private var now = 0L
+
+    // Расширенная аутентификация (SEVEN-249): область провайдера ответов, текущий вызов — только поток хоста
+    private val authScope: CoroutineScope? = config.enhancedAuth?.let { CoroutineScope(SupervisorJob() + authContext) }
+    private var authJob: Job? = null
 
     private val packetLog = config.logger !== MqttLogger.None
     private val incomingPackets = PacketScanner { type, size -> logPacket(PacketDirection.Incoming, type, size) }
@@ -325,6 +346,7 @@ internal class MqttClientImpl(
     private fun apply(action: EngineAction, out: MutableList<HostAction>) {
         when (action) {
             is EngineAction.Connect -> {
+                cancelAuth()
                 wroteThisStep = false
                 if (packetLog) incomingPackets.reset()
                 out += HostAction.Connect(action.host, action.port, action.timeoutMs)
@@ -338,6 +360,7 @@ internal class MqttClientImpl(
                 out += HostAction.Write(action.bytes)
             }
             EngineAction.CloseTransport -> {
+                cancelAuth()
                 // После записи (DISCONNECT, DISCONNECT(code)) или при штатном закрытии — дописать, затем закрыть;
                 // хост закроет сразу, если очередь записи пуста
                 out += if (wroteThisStep || closeRequested) {
@@ -359,7 +382,30 @@ internal class MqttClientImpl(
                 rejectedGroup = action.group
                 safeLog { groupRejected(action.filters, action.limit) }
             }
+            is EngineAction.AuthChallenge -> startAuth(action)
         }
+    }
+
+    /** Вызов брокера: ответ провайдера — вне потока хоста, результат — запросом в очередь (SEVEN-249). */
+    private fun startAuth(challenge: EngineAction.AuthChallenge) {
+        val auth = config.enhancedAuth ?: return
+        val scope = authScope ?: return
+        cancelAuth()
+        authJob = scope.launch {
+            val response = try {
+                EngineCommand.AuthResponse(challenge.connection, auth.respond(challenge.method, challenge.data))
+            } catch (e: Throwable) {
+                // Отменён (новый вызов, конец подключения, закрытие) — ответа нет; иначе — отказ без текста ошибки (H11)
+                currentCoroutineContext().ensureActive()
+                EngineCommand.AuthResponse(challenge.connection, null, failed = true)
+            }
+            submit(ClientRequest.Command(response))
+        }
+    }
+
+    private fun cancelAuth() {
+        authJob?.cancel()
+        authJob = null
     }
 
     private fun onState(state: ConnectionState) {
@@ -455,6 +501,7 @@ internal class MqttClientImpl(
         if (!finalized.compareAndSet(false, true)) return
         finishError.value = error
         lock.withLock { lifecycle = CLOSED }
+        authScope?.cancel()
         while (true) reject(requests.tryReceive().getOrNull() ?: break)
         requests.close()
     }

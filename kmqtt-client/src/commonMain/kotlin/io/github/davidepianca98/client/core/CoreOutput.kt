@@ -49,6 +49,15 @@ public sealed interface CoreOutput {
     public data class Dropped(public val reason: DropReason) : CoreOutput
 
     /**
+     * Брокер продолжает расширенную аутентификацию (AUTH 0x18, MQTT 5 §4.12, SEVEN-249): [data] — его Authentication
+     * Data (`null` — без неё), [method] — метод (совпадает с [SessionAuth.method]). Ответ — [MqttSessionCore.authResponse]
+     * или отказ [MqttSessionCore.authFailed]; срок — тот же `connackTimeoutMs` от CONNECT. `toString()` без данных (H11).
+     */
+    public class AuthChallenge(public val method: String, public val data: ByteArray?) : CoreOutput {
+        override fun toString(): String = "AuthChallenge(method=$method, size=${data?.size ?: -1})"
+    }
+
+    /**
      * Конец подключения, выдаётся ровно один раз. `error == null` — штатное закрытие (`disconnect` + EOF или дедлайн
      * linger). После него в [MqttSessionCore.takeOutbound] может остаться последний пакет (DISCONNECT с кодом ошибки
      * в MQTT 5) — хост пишет его без ожидания и закрывает соединение.
