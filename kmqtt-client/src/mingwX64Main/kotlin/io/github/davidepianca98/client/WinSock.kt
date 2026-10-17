@@ -10,6 +10,7 @@ import kotlinx.cinterop.IntVar
 import kotlinx.cinterop.UIntVar
 import kotlinx.cinterop.addressOf
 import kotlinx.cinterop.alloc
+import kotlinx.cinterop.allocArray
 import kotlinx.cinterop.convert
 import kotlinx.cinterop.get
 import kotlinx.cinterop.memScoped
@@ -70,6 +71,9 @@ internal object WinSock {
     const val WSANO_DATA: Int = 11004
     const val FD_SETSIZE: Int = 64
 
+    /** Код ошибки потерян (см. [errorOr]); в `kind` — `WSA-unknown`. */
+    const val UNKNOWN_ERROR: Int = -1
+
     private val started = atomic(false)
     private val startLock = reentrantLock()
 
@@ -113,15 +117,27 @@ internal object WinSock {
         10064 -> "WSAEHOSTDOWN"
         10065 -> "WSAEHOSTUNREACH"
         10093 -> "WSANOTINITIALISED"
+        UNKNOWN_ERROR -> "WSA-unknown"
         else -> "WSA$code"
     }
 
     fun ioError(code: Int): MqttError = MqttError.Io(errorName(code), IllegalStateException("WinSock error $code"))
 
+    /**
+     * Код последней ошибки сразу после вызова. `WSAGetLastError` живёт до следующего вызова Win32 в этом потоке, а
+     * Kotlin/Native между возвратом из C и следующим вызовом может пройти точку безопасности сборщика (там свои вызовы
+     * Win32), и код теряется — `WSAGetLastError()` даёт 0 (замечено на ≈ 87-м цикле подряд, SEVEN-250). Потерянный код —
+     * [lost]: вызывающий трактует его как «повторить позже» (`WSAEWOULDBLOCK`), настоящая ошибка проявится снова — с
+     * кодом в `SO_ERROR` или при следующем вызове.
+     */
+    private inline fun errorOr(failed: Boolean, lost: Int): Int =
+        if (failed) WSAGetLastError().let { if (it == 0) lost else it } else 0
+
+    /** `FIONBIO`: 0 или код ошибки WinSock. */
     fun setNonBlocking(s: ULong): Int = memScoped {
         val on = alloc<UIntVar>()
         on.value = 1u
-        ioctlsocket(s, FIONBIO.toInt(), on.ptr.reinterpret())
+        errorOr(ioctlsocket(s, FIONBIO.toInt(), on.ptr.reinterpret()) != 0, UNKNOWN_ERROR)
     }
 
     fun setIntOption(s: ULong, level: Int, option: Int, value: Int): Int = memScoped {
@@ -148,13 +164,40 @@ internal object WinSock {
         closesocket(s)
     }
 
+    /**
+     * `send`: число отданных байтов (≥ 0) или минус код ошибки WinSock. Код берётся сразу после вызова: позже его может
+     * затереть рантайм Kotlin/Native (освобождение памяти, сборщик) — так `WSAEWOULDBLOCK` превращался в 0 (SEVEN-250).
+     */
     fun sendSome(s: ULong, bytes: ByteArray, offset: Int, length: Int): Int {
         if (length == 0) return 0
-        return bytes.usePinned { pinned -> send(s, pinned.addressOf(offset), length, 0) }
+        return bytes.usePinned { pinned ->
+            val n = send(s, pinned.addressOf(offset), length, 0)
+            if (n < 0) -errorOr(true, WSAEWOULDBLOCK) else n
+        }
     }
 
+    /** `recv`: число байтов (> 0), 0 — конец потока, минус код ошибки WinSock (как [sendSome]). */
     fun recvSome(s: ULong, buffer: ByteArray): Int =
-        buffer.usePinned { pinned -> recv(s, pinned.addressOf(0), buffer.size, 0) }
+        buffer.usePinned { pinned ->
+            val n = recv(s, pinned.addressOf(0), buffer.size, 0)
+            if (n < 0) -errorOr(true, WSAEWOULDBLOCK) else n
+        }
+
+    /**
+     * Неблокирующий `connect` на адрес [address]: 0 — подключено сразу, иначе код ошибки WinSock (в т. ч. WOULDBLOCK;
+     * потерянный код — тоже WOULDBLOCK: итог подключения скажут `select` и `SO_ERROR`).
+     */
+    fun connectTo(s: ULong, address: Address): Int = memScoped {
+        val raw = allocArray<ByteVar>(address.bytes.size)
+        address.bytes.forEachIndexed { i, b -> raw[i] = b }
+        errorOr(platform.posix.connect(s, raw.reinterpret(), address.bytes.size) != 0, WSAEWOULDBLOCK)
+    }
+
+    /** Новый TCP-сокет семейства [family]: сокет или [INVALID] и код ошибки. */
+    fun openStream(family: Int): Pair<ULong, Int> {
+        val s = socket(family, SOCK_STREAM, IPPROTO_TCP)
+        return if (s == INVALID) INVALID to errorOr(true, UNKNOWN_ERROR) else s to 0
+    }
 
     /** Адрес для `connect`: байты `sockaddr` и семейство. */
     class Address(val family: Int, val bytes: ByteArray)

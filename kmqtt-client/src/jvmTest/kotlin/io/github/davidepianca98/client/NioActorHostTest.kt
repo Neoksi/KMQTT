@@ -55,6 +55,8 @@ class NioActorHostTest {
         var throwOnRun: Throwable? = null
 
         override fun runOnce(nowMs: Long, events: List<TransportEvent>): HostStep {
+            // SEVEN-250: дедлайн — до отметки вызова (тест, увидев отметку, меняет его; иначе гонка в driverDeadlineWakesHost)
+            val nextDeadline = deadline
             thread = Thread.currentThread()
             this.events.addAll(events)
             onRun?.invoke()
@@ -62,7 +64,7 @@ class NioActorHostTest {
             throwOnRun?.let { throw it }
             val actions = ArrayList<HostAction>()
             while (true) actions += commands.poll() ?: break
-            return HostStep(deadline, actions)
+            return HostStep(nextDeadline, actions)
         }
 
         override fun onStopped(cause: Throwable?) {

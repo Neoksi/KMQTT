@@ -11,6 +11,7 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.IO
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeoutOrNull
 import platform.posix.fd_set
 import platform.posix.timeval
@@ -35,8 +36,9 @@ internal fun nextHostThreadName(): String = WinSockHost.THREAD_NAME_PREFIX + hos
  * ([WakeSocket]); пробуждение до сна не теряется.
  *
  * Резолв имени — на `Dispatchers.IO` (W6 §4.6), остальное — на потоке хоста. [close]: текущий транспорт закрывается
- * сразу (идущее подключение прерывается, H5), дописывающиеся — не дольше своих сроков, затем поток выходит, закрыв
- * сокет пробуждения; приостановка — до выхода цикла, не дольше таймаута. Вызов [close] с потока хоста (из драйвера) не
+ * сразу (идущее подключение прерывается, H5), дописывающиеся — не дольше своих сроков, затем цикл выходит, закрыв
+ * сокет пробуждения, а [close] завершает воркер и дожидается конца его потока; приостановка — не дольше таймаута.
+ * Хост, остановленный исключением драйвера, держит простаивающий воркер до [close] (фасад всегда его вызывает). Вызов [close] с потока хоста (из драйвера) не
  * ждёт (вернёт `false`). Одноразовый: после [close] не перезапускается.
  *
  * TLS и WebSocket на mingwX64 нет (SEVEN-250, план подкарточек): фабрика `MqttClient(options)` такие опции отклоняет.
@@ -101,11 +103,23 @@ public class WinSockHost internal constructor(
         state.value = CLOSED
         stopRequested.value = true
         wakeup()
-        if (done.isCompleted) return true
         // С потока хоста (из драйвера) ждать самого себя нельзя: цикл выйдет после текущего runOnce
         val w = worker.value
         if (w != null && Worker.current == w) return false
-        return withTimeoutOrNull(timeoutMs.coerceAtLeast(1)) { done.await() } != null
+        val stopped = withTimeoutOrNull(timeoutMs.coerceAtLeast(1)) { done.await() } != null
+        if (stopped) terminateWorker()
+        return stopped
+    }
+
+    /** Завершить воркер, чей цикл уже вышел, и дождаться конца потока (освобождает его дескрипторы). Один раз. */
+    private suspend fun terminateWorker() {
+        val w = worker.getAndSet(null) ?: return
+        val future = try {
+            w.requestTermination(processScheduledJobs = false)
+        } catch (_: IllegalStateException) {
+            return // уже завершён
+        }
+        withContext(Dispatchers.IO) { future.result }
     }
 
     private fun loop(driver: HostDriver, wakeSocket: WakeSocket, context: WinSockTransportContext, dnsScope: CoroutineScope) {
@@ -174,7 +188,7 @@ public class WinSockHost internal constructor(
                 driver.onStopped(cause)
             } catch (_: Throwable) {
             }
-            worker.value?.requestTermination(processScheduledJobs = false)
+            // Воркер завершает close() снаружи: самозавершение изнутри задачи оставляет дескрипторы потока (≈ 2 на хост)
             done.complete(Unit)
         }
     }

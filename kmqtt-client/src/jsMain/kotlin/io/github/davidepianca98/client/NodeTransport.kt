@@ -64,7 +64,9 @@ public fun interface NodeTransportFactory {
 public class NodeTransport internal constructor(
     private val context: NodeTransportContext,
     private val tls: TLSClientSettings?,
-    private val verifyHostname: Boolean
+    private val verifyHostname: Boolean,
+    /** Опция `lookup` сокета (функция резолва `dns.lookup`); `null` — резолв Node по умолчанию. Для тестов. */
+    private val lookup: dynamic = null
 ) : MqttTransport {
 
     /** TCP-транспорт. */
@@ -99,6 +101,7 @@ public class NodeTransport internal constructor(
         options.port = port
         options.allowHalfOpen = true
         options.noDelay = true
+        if (lookup != null) options.lookup = lookup
         val s: dynamic = if (tls == null) {
             netConnect(options)
         } else {

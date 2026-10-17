@@ -107,8 +107,7 @@ internal class WinSockPeer(private var socket: ULong) : ContractPeer {
                 }
                 n == 0 -> fail("EOF после $offset байт из $count")
                 else -> {
-                    val error = WinSock.lastError()
-                    if (error != WinSock.WSAEWOULDBLOCK) fail("recv: ${WinSock.errorName(error)} после $offset байт")
+                    if (-n != WinSock.WSAEWOULDBLOCK) fail("recv: ${WinSock.errorName(-n)} после $offset байт")
                     if (start.elapsedNow().inWholeMilliseconds > timeoutMs) fail("за $timeoutMs мс пришло $offset из $count")
                     delay(1)
                 }
@@ -122,8 +121,7 @@ internal class WinSockPeer(private var socket: ULong) : ContractPeer {
         while (offset < bytes.size) {
             val n = WinSock.sendSome(socket, bytes, offset, bytes.size - offset)
             if (n < 0) {
-                val error = WinSock.lastError()
-                if (error != WinSock.WSAEWOULDBLOCK) fail("send: ${WinSock.errorName(error)}")
+                if (-n != WinSock.WSAEWOULDBLOCK) fail("send: ${WinSock.errorName(-n)}")
                 delay(1)
             } else {
                 offset += n
@@ -144,8 +142,7 @@ internal class WinSockPeer(private var socket: ULong) : ContractPeer {
                 n > 0 -> extra += n
                 n == 0 -> return EndOfStream(PeerEnd.Fin, extra)
                 else -> {
-                    val error = WinSock.lastError()
-                    if (error != WinSock.WSAEWOULDBLOCK) return EndOfStream(PeerEnd.Reset, extra)
+                    if (-n != WinSock.WSAEWOULDBLOCK) return EndOfStream(PeerEnd.Reset, extra)
                     if (start.elapsedNow().inWholeMilliseconds > timeoutMs) return EndOfStream(PeerEnd.Timeout, extra)
                     delay(1)
                 }

@@ -2,17 +2,9 @@ package io.github.davidepianca98.client
 
 import io.github.davidepianca98.client.core.MqttCoreApi
 import kotlinx.atomicfu.atomic
-import kotlinx.cinterop.ByteVar
-import kotlinx.cinterop.allocArray
-import kotlinx.cinterop.memScoped
-import kotlinx.cinterop.reinterpret
-import kotlinx.cinterop.set
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.launch
-import platform.posix.IPPROTO_TCP
-import platform.posix.SOCK_STREAM
-import platform.posix.socket
 
 /**
  * Окружение транспорта внутри [WinSockHost]: пробуждение, область для резолва имён на `Dispatchers.IO`, размер буфера
@@ -161,12 +153,15 @@ public class WinSockTransport internal constructor(
         when (phase) {
             Phase.Connecting -> {
                 if (failed || writable) {
+                    // Итог connect — по SO_ERROR: код — отказ; 0 и готовность к записи — подключено; 0 при одном
+                    // exceptfds (без кода) — ждём дальше, срок подключения всё равно ограничивает ожидание
                     val error = WinSock.pendingError(socket)
-                    if (error == 0 && !failed) {
-                        onConnected()
-                    } else {
-                        fail(WinSock.ioError(if (error != 0) error else WinSock.lastError()))
-                        return
+                    when {
+                        error != 0 -> {
+                            fail(WinSock.ioError(error))
+                            return
+                        }
+                        writable -> onConnected()
                     }
                 }
             }
@@ -180,28 +175,24 @@ public class WinSockTransport internal constructor(
 
     private fun open(address: WinSock.Address) {
         phase = Phase.Connecting
-        val s = socket(address.family, SOCK_STREAM, IPPROTO_TCP)
+        val (s, openError) = WinSock.openStream(address.family)
         if (s == WinSock.INVALID) {
-            fail(WinSock.ioError(WinSock.lastError()))
+            fail(WinSock.ioError(openError))
             return
         }
         socket = s
         context.active += this
-        if (WinSock.setNonBlocking(s) != 0) {
-            fail(WinSock.ioError(WinSock.lastError()))
+        val nonBlocking = WinSock.setNonBlocking(s)
+        if (nonBlocking != 0) {
+            fail(WinSock.ioError(nonBlocking))
             return
         }
         WinSock.noDelay(s)
-        val rc = memScoped {
-            val raw = allocArray<ByteVar>(address.bytes.size)
-            address.bytes.forEachIndexed { i, b -> raw[i] = b }
-            platform.posix.connect(s, raw.reinterpret(), address.bytes.size)
-        }
-        if (rc == 0) {
+        val error = WinSock.connectTo(s, address)
+        if (error == 0) {
             onConnected()
             return
         }
-        val error = WinSock.lastError()
         if (error != WinSock.WSAEWOULDBLOCK && error != WinSock.WSAEINPROGRESS && error != WinSock.WSAEALREADY) {
             fail(WinSock.ioError(error))
         }
@@ -220,8 +211,7 @@ public class WinSockTransport internal constructor(
             val bytes = writeQueue.first()
             val n = WinSock.sendSome(s, bytes, writeOffset, minOf(bytes.size - writeOffset, MAX_SEND_CHUNK))
             if (n < 0) {
-                val error = WinSock.lastError()
-                if (error != WinSock.WSAEWOULDBLOCK) fail(WinSock.ioError(error))
+                if (-n != WinSock.WSAEWOULDBLOCK) fail(WinSock.ioError(-n))
                 return
             }
             writeOffset += n
@@ -245,8 +235,7 @@ public class WinSockTransport internal constructor(
                     return
                 }
                 else -> {
-                    val error = WinSock.lastError()
-                    if (error != WinSock.WSAEWOULDBLOCK) fail(WinSock.ioError(error))
+                    if (-n != WinSock.WSAEWOULDBLOCK) fail(WinSock.ioError(-n))
                     return
                 }
             }

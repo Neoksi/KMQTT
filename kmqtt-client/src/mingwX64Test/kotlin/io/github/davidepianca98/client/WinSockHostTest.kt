@@ -12,6 +12,14 @@ import kotlinx.coroutines.test.TestResult
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
+import kotlinx.cinterop.UIntVar
+import kotlinx.cinterop.alloc
+import kotlinx.cinterop.memScoped
+import kotlinx.cinterop.ptr
+import kotlinx.cinterop.value
+import kotlinx.coroutines.delay
+import platform.windows.GetCurrentProcess
+import platform.windows.GetProcessHandleCount
 import platform.windows.Sleep
 import kotlin.test.Test
 import kotlin.test.assertEquals
@@ -143,6 +151,44 @@ internal class WinSockHostTest {
         } finally {
             host.close(5_000)
         }
+    }
+
+    /** K6: 1 000 циклов start/connect/close не растят число дескрипторов процесса (потоки-воркеры, сокеты, события). */
+    @Test
+    fun thousandStartCloseCyclesLeakNoHandles() = hostTest {
+        val server = WinSockServer(false)
+        try {
+            repeat(5) { cycle(server) }
+            delay(300)
+            val before = processHandles()
+            val t0 = TimeSource.Monotonic.markNow()
+            repeat(1_000) { cycle(server) }
+            val elapsed = t0.elapsedNow().inWholeMilliseconds
+            delay(500)
+            val after = processHandles()
+            println("WinSockHostTest: 1000 циклов за $elapsed мс; дескрипторы процесса $before → $after")
+            assertTrue(after <= before + 20, "дескрипторы процесса: $before → $after")
+        } finally {
+            server.close()
+        }
+    }
+
+    private suspend fun cycle(server: WinSockServer) {
+        val driver = ContractDriver()
+        val host = WinSockHost()
+        host.start(driver)
+        driver.send(host, HostAction.Connect("127.0.0.1", server.port, 5_000))
+        val peer = server.accept()
+        assertEquals(TransportEvent.Connected, driver.awaitEvent())
+        assertTrue(host.close(), "close() дождался остановки")
+        assertNull(withTimeout(1_000) { driver.stopped.await() })
+        peer.close()
+    }
+
+    private fun processHandles(): Long = memScoped {
+        val count = alloc<UIntVar>()
+        GetProcessHandleCount(GetCurrentProcess(), count.ptr)
+        count.value.toLong()
     }
 
     @Test

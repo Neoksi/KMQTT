@@ -173,7 +173,8 @@ public class NodeHost internal constructor(
             created = transportFactory.create(context)
             created.connect(action.host, action.port, now + action.timeoutMs)
             created
-        } catch (e: Exception) {
+        } catch (e: Throwable) {
+            // Throwable, не Exception: ошибка JS (`Error`), брошенная синхронно из `net.connect`, — не `Exception`
             runCatching { created?.close() }
             pending += TransportEvent.Failed(MqttError.Io(NodeTransport.codeOf(e), e))
             schedule()
