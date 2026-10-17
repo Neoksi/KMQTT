@@ -162,6 +162,7 @@ What it gives you:
 - orderly close that avoids a TCP reset;
 - TLS with host name verification on by default (JVM);
 - MQTT over WebSocket, `ws://` and `wss://` (JVM);
+- MQTT 5 enhanced authentication (AUTH challenge/response, for example SCRAM), the same over every transport;
 - no blocking call on your threads: a single daemon thread `kmqtt-io-<n>` per client does all the I/O.
 
 ### Quick start
@@ -450,6 +451,46 @@ client.config.transport // MqttTransportKind.SecureWebSocket
   close frame or end of stream (bounded by the same flush allowance of about a second) before closing the socket. A close
   frame of the server is answered with the same code and ends the stream like a TCP FIN.
 
+### Enhanced authentication (MQTT 5)
+
+```kotlin
+val client = MqttClient(
+    MqttClientOptions(
+        host = "broker.example.org",
+        port = 8883,
+        tls = TLSClientSettings(serverCertificate = "broker.pem"),
+        enhancedAuth = MqttEnhancedAuth(
+            method = "SCRAM-SHA-256",
+            initialData = { scram.clientFirst() }, // called for every connection: a fresh nonce each time
+            respond = { method, data -> scram.answer(data) }, // suspend; throw to refuse
+        ),
+    )
+)
+```
+
+- CONNECT carries the Authentication Method and the data of `initialData` (none when it returns `null`). Each AUTH of
+  the broker with "continue authentication" (0x18) calls `respond(method, data)`; its result goes back in AUTH 0x18 (the
+  bytes as Authentication Data, `null` for an AUTH without data). The exchange may take any number of steps and ends
+  with CONNACK; it runs again on every reconnect.
+- `initialData` runs on the I/O thread, so it must be fast. `respond` runs in a coroutine on `Dispatchers.Default`,
+  never on the I/O thread; switch the dispatcher yourself for blocking work.
+- Outcomes: a refusal of the broker (CONNACK `NOT_AUTHORIZED`, `BAD_AUTHENTICATION_METHOD`, ...) is
+  `MqttError.Refused(code)`. When `respond` throws, the client sends DISCONNECT `NOT_AUTHORIZED` and the attempt ends
+  with `MqttError.Refused(NOT_AUTHORIZED)`; when `initialData` throws, nothing is sent and the outcome is the same. The
+  text of the exception is never stored or reported.
+  The whole exchange is bounded by `connackTimeout` from CONNECT: a silent broker gives `MqttError.ConnackTimeout`, a
+  `respond` that has not answered in time gives `Refused(NOT_AUTHORIZED)` and its late answer is dropped. An answer
+  computed for a connection that broke meanwhile is never sent on the next one. The client then reconnects by its
+  `ReconnectPolicy`, as after any refusal.
+- A successful CONNACK must carry the same Authentication Method, otherwise the connection ends with
+  `MqttError.Protocol(PROTOCOL_ERROR)`; so do an AUTH with another method or reason code, and an AUTH after CONNACK.
+- MQTT 3.1.1 has no AUTH packet: `MqttClientOptions(version = MQTT3_1_1, enhancedAuth = ...)` throws
+  `IllegalArgumentException`.
+- Not supported: re-authentication during a session (AUTH 0x19), and the Authentication Data of a successful CONNACK
+  (for example the SCRAM server signature) is not handed to the application, so the exchange does not authenticate the
+  broker; rely on TLS for that.
+- `MqttEnhancedAuth.toString()` and `MqttClientOptions.toString()` show the method only, never the data.
+
 ### Closing
 
 `close()` shuts the client down in an orderly way:
@@ -480,8 +521,9 @@ The broker never publishes the will after an orderly close.
 
 ### Limitations of the first version
 
-- **No MQTT 5 enhanced authentication** (AUTH packets). Use the blocking `MQTTClient` for it. (WebSocket was added
-  later, see [WebSocket](#websocket-jvm).)
+- **Enhanced authentication without re-authentication** (AUTH 0x19 during a session) and without access to the final
+  CONNACK data, see [Enhanced authentication](#enhanced-authentication-mqtt-5). (WebSocket and enhanced authentication
+  were added later than the first version.)
 - **Persistent session is opt-in** (`persistentSession`, see [Persistent session](#persistent-session)); its state is kept
   in memory only. A QoS 2 publication dropped on resume (time-to-live passed, `resend = false`) may leave its packet
   identifier held by a broker that already sent PUBREC. Topic aliases are not used.
@@ -494,7 +536,7 @@ The broker never publishes the will after an orderly close.
 
 ### Security
 
-- Passwords, the payload and topic of the will, topics, filters and addresses never appear in `toString()` of the public
+- Passwords, authentication data, the payload and topic of the will, topics, filters and addresses never appear in `toString()` of the public
   types, in `MqttError` or in `MqttLogger` events. `MqttError.Io` prints only the class name of its cause.
 - Memory is bounded by `MqttLimits` (packet size, topic length, incoming buffer, number of filters, publications in the
   request queue) and `OfflineQueue.capacity`; a violation gives a typed outcome, not an `OutOfMemoryError`.
@@ -509,7 +551,8 @@ The broker never publishes the will after an orderly close.
 - For integration tests start the fork's own broker in a thread (`io.github.davidepianca98.mqtt.broker.Broker`, module
   `kmqtt-broker`) and connect to `127.0.0.1`; see `EmbeddedBrokerSupport.kt` and `MqttClientBrokerTest.kt` in
   `kmqtt-client/src/jvmTest`. TLS tests use the same broker with `TLSSettings`, WebSocket tests with
-  `webSocketPort` (with `TLSSettings` that port speaks `wss`), see `WebSocketBrokerTest.kt`.
+  `webSocketPort` (with `TLSSettings` that port speaks `wss`), see `WebSocketBrokerTest.kt`. Enhanced authentication
+  tests give the broker `enhancedAuthenticationProviders`, see `EnhancedAuthBrokerTest.kt`.
 - Run the module's tests from the fork's root with `./gradlew :kmqtt-client:jvmTest` (when the fork is included in a larger
   build, the path is prefixed by the included build, for example `:kmqtt:kmqtt-client:jvmTest`).
 
@@ -524,7 +567,7 @@ The broker never publishes the will after an orderly close.
 | Publication result | none | `Sent`/`Delivered`/`Expired`/`Failed` |
 | Incoming | callback | ordered `Flow` with back pressure and session epochs |
 | WebSocket | yes | yes (JVM) |
-| Enhanced auth | yes | no |
+| Enhanced auth | yes (with re-authentication) | yes (MQTT 5, without re-authentication) |
 
 ## Getting Started with the broker
 
