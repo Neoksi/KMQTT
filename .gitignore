@@ -98,3 +98,6 @@ build/
 
 local.properties
 .kotlin/
+
+# Kotlin/JS: lock-файл yarn создаётся сборкой jsNode (SEVEN-250), не храним, как .kotlin/
+kotlin-js-store/
