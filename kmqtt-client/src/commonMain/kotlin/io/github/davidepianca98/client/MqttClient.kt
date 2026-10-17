@@ -152,14 +152,14 @@ public interface MqttClient {
 /**
  * Creates a client that runs on the given [host].
  *
- * The factory is in common code so that targets without an I/O host still compile; on the JVM use
- * `MqttClient(options)` instead. The [host] is single-use and owned by the client: [MqttClient.close] closes it too.
+ * The factory is in common code so that targets without an I/O host still compile; on the JVM, JS (Node.js) and
+ * mingwX64 use the platform factory `MqttClient(options)` instead. The [host] is single-use and owned by the client: [MqttClient.close] closes it too.
  * [clock] must be the clock of the host.
  *
  * **Security:** when [MqttClientOptions.tls] is set this factory always throws [IllegalArgumentException] at
  * creation, before the host is started: a host passed from outside is not known to apply TLS (the public
- * `NioActorHost()` speaks plain TCP), and the client never falls back to plain text. Use the JVM factory
- * `MqttClient(options)` for TLS. The same holds for [MqttClientOptions.webSocket]: a host passed from outside is not
+ * `NioActorHost()` speaks plain TCP), and the client never falls back to plain text. Use the platform factory
+ * `MqttClient(options)` for TLS (JVM, Node.js). The same holds for [MqttClientOptions.webSocket]: a host passed from outside is not
  * known to speak WebSocket, so `webSocket != null` throws [IllegalArgumentException] too. Invalid options also throw
  * [IllegalArgumentException]; the message contains no addresses or secrets.
  */

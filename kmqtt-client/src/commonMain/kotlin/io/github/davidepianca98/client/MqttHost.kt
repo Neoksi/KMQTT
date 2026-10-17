@@ -107,7 +107,7 @@ public sealed interface HostAction {
 /**
  * Транспорт одного подключения (TCP, TLS поверх TCP…), которым владеет хост. Все методы — только на потоке хоста;
  * результаты — событиями ([events]), чтение — тоже событиями ([TransportEvent.Bytes]): отдельного `read` нет,
- * готовность сокета обслуживает хост своей платформенной частью (на JVM — `NioTransport` и селектор).
+ * готовность сокета обслуживает хост своей платформенной частью (на JVM — `NioTransport` и селектор, на Node.js — события `net.Socket`, на mingwX64 — `select` WinSock).
  *
  * Один экземпляр — одно подключение: после [close] или [TransportEvent.Failed] транспорт не переиспользуется.
  */
@@ -190,9 +190,11 @@ public interface HostDriver {
 
 /**
  * Host of the client loop: a thread (or another executor) that runs the [HostDriver] and performs the I/O. Single-use:
- * [start] is called once and the host cannot be restarted after [close]. The default implementation is `NioActorHost`
- * (JVM, plain TCP). Implementing a custom host is experimental: the driver and transport contracts are marked
- * `@MqttCoreApi` and may change.
+ * [start] is called once and the host cannot be restarted after [close]. The implementations are `NioActorHost` (JVM),
+ * `NodeHost` (JS, Node.js event loop, no thread of its own) and `WinSockHost` (mingwX64); each is created by the
+ * platform factory `MqttClient(options)` and passes the same contract suite (`MqttHostContractTest`, commonTest).
+ * Implementing a custom host is experimental: the driver and transport contracts are marked `@MqttCoreApi` and may
+ * change.
  */
 public interface MqttHost {
     /** Starts the loop with the driver. A second call, or a call after [close], throws [IllegalStateException]. */

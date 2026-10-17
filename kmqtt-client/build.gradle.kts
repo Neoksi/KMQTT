@@ -14,6 +14,12 @@ kotlin {
     js {
         nodejs {
             binaries.executable()
+            // SEVEN-250: контрактные тесты хоста идут в реальном времени (8 МиБ записи, 200 циклов, DNS до 30 с)
+            testTask {
+                useMocha {
+                    timeout = "180s"
+                }
+            }
         }
     }
     mingwX64 {}
@@ -56,6 +62,8 @@ kotlin {
             dependencies {
                 implementation(kotlin("test-common"))
                 implementation(kotlin("test-annotations-common"))
+                // SEVEN-250: общий контракт хоста (commonTest/hostcontract) — runTest + реальное время
+                implementation(libs.kotlinx.coroutines.test)
             }
         }
         val jvmMain by getting {}

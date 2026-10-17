@@ -66,7 +66,7 @@ private val temporaryCounter = atomic(0L)
  * записи ушёл в ОС, или по сроку. Пути ошибок без записи (обрыв, ping-таймаут, зависший потребитель) закрывают сразу.
  *
  * Безопасность (решение владельца 2026-10-16, S06b-T05b): при `config.tls != null` клиент создаётся только с хостом,
- * который сам применяет TLS ([hostAppliesTls] — его ставит jvm-фабрика `MqttClient(options)`); иначе — отказ
+ * который сам применяет TLS ([hostAppliesTls] — его ставят платформенные фабрики `MqttClient(options)` JVM и JS); иначе — отказ
  * `IllegalArgumentException` при создании, до запуска хоста: никогда не подключаться открытым текстом.
  * То же для `config.webSocket != null` ([hostAppliesWebSocket], SEVEN-248): WebSocket применяет только хост jvm-фабрики.
  * Так же при создании отказывает комбинация `tls.checkServerCertificate = false` и `verifyHostname = true`

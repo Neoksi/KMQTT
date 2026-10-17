@@ -30,8 +30,9 @@ import kotlin.time.Duration.Companion.seconds
  * @param credentials user name and password sent in CONNECT; `null` for anonymous access (pass `null`, not an empty
  *   user name).
  * @param tls TLS settings; `null` means plain TCP (or `ws://` with [webSocket]). With [webSocket] it makes the
- *   connection `wss://`. TLS is applied by the host the client is created with: the JVM
- *   factory `MqttClient(options)` builds a TLS host; the common factory `MqttClient(options, host, clock)` refuses
+ *   connection `wss://`. TLS is applied by the host the client is created with: the platform
+ *   factory `MqttClient(options)` on the JVM and on JS (Node.js) builds a TLS host, the mingwX64 one refuses `tls`;
+ *   the common factory `MqttClient(options, host, clock)` refuses
  *   options with `tls != null` ([IllegalArgumentException]), so a client with `tls` never connects in plain text.
  *   ALPN protocols and an explicit SNI name come from [TLSClientSettings.alpnProtocols] and
  *   [TLSClientSettings.serverNameIndications]. [TLSClientSettings.checkServerCertificate] `= false` ("trust all")
@@ -85,7 +86,7 @@ import kotlin.time.Duration.Companion.seconds
  *   it keeps a session, nor without [persistentSession].
  * @param webSocket MQTT over WebSocket ([MqttWebSocket]: request path and extra headers); `null` (the default) means
  *   MQTT directly over TCP or TLS. With [tls] the connection is `wss://` (the same certificate and [verifyHostname]
- *   rules as plain TLS), without it `ws://`. Like TLS it is applied only by the JVM factory `MqttClient(options)`; the
+ *   rules as plain TLS), without it `ws://`. It is applied only by the JVM factory `MqttClient(options)` (the JS and mingwX64 factories refuse it); the
  *   common factory `MqttClient(options, host, clock)` refuses options with `webSocket != null`
  *   ([IllegalArgumentException]). The resulting transport is [transport].
  * @param enhancedAuth MQTT 5 enhanced authentication (AUTH packets, see [MqttEnhancedAuth]); `null` (the default) for

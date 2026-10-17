@@ -146,10 +146,20 @@ public API uses `kotlinx.coroutines` types (`Flow`, `StateFlow`, `Deferred`, `Jo
 `ReasonCode`, `MQTTVersion`, `TLSClientSettings`); `kmqtt-client` exposes both modules as `api` dependencies, so they
 come with it.
 
-**Targets.** The API and the protocol engine are in `commonMain` and compile for every target, but the only I/O host
-that exists is the JVM one (`NioActorHost`, a `java.nio` selector on its own thread). On JavaScript and native targets
-the code compiles but there is no host to run it, so use the blocking `MQTTClient` there (or implement `MqttHost`, see
-[Limitations](#limitations-of-the-first-version)).
+**Targets.** The API and the protocol engine are in `commonMain` and compile for every target. An I/O host (`MqttHost`)
+exists for:
+
+| Target | Host (factory `MqttClient(options)`) | TCP | TLS | WebSocket |
+|---|---|---|---|---|
+| JVM (incl. Android) | `NioActorHost`: a `java.nio` selector on its own thread `kmqtt-io-<n>` | yes | yes | yes |
+| JS, Node.js | `NodeHost`: turns of the Node event loop (`net`, `tls`), no thread of its own | yes | yes | no |
+| mingwX64 (Windows) | `WinSockHost`: WinSock `select` on its own Kotlin/Native worker `kmqtt-io-<n>` | yes | no | no |
+
+On the other native targets (Linux, Apple) and in browsers the code compiles but there is no host to run it yet, so
+use the blocking `MQTTClient` there (or implement `MqttHost`, see [Limitations](#limitations-of-the-first-version)).
+Each host passes the same contract test suite (`kmqtt-client/src/commonTest/.../hostcontract`). Options a platform
+factory cannot honour (TLS on mingwX64, WebSocket on JS and mingwX64) are refused with `IllegalArgumentException`; the
+client never falls back to plain text.
 
 What it gives you:
 
@@ -160,10 +170,11 @@ What it gives you:
   a stale command is never sent late;
 - one ordered `Flow` of incoming messages with session boundaries and real back pressure (no message is dropped);
 - orderly close that avoids a TCP reset;
-- TLS with host name verification on by default (JVM);
+- TLS with host name verification on by default (JVM, Node.js);
 - MQTT over WebSocket, `ws://` and `wss://` (JVM);
 - MQTT 5 enhanced authentication (AUTH challenge/response, for example SCRAM), the same over every transport;
-- no blocking call on your threads: a single daemon thread `kmqtt-io-<n>` per client does all the I/O.
+- no blocking call on your threads: a single daemon thread `kmqtt-io-<n>` per client does all the I/O (on Node.js the
+  event loop does, without blocking calls).
 
 ### Quick start
 
@@ -529,8 +540,13 @@ The broker never publishes the will after an orderly close.
   identifier held by a broker that already sent PUBREC. Topic aliases are not used.
 - **QoS 2** (publishing and receiving) is implemented on the main path only and has no dedicated tests; the API and the
   tests concentrate on QoS 0 and 1.
-- **I/O host on the JVM only.** There is no host for JavaScript or native targets. A custom host implements `MqttHost`
-  (plus `HostDriver`, `MqttTransport`, ...), which is experimental API marked `@MqttCoreApi` and may change.
+- **I/O hosts for the JVM, Node.js and mingwX64 only** (see **Targets** above). There is no host for Linux,
+  Apple targets or browsers (browsers would need a WebSocket-only host). TLS exists on the JVM and Node.js, not on
+  mingwX64; WebSocket only on the JVM. On Node.js under Windows the operating system accepts a write of any size at
+  once (libuv writes through IOCP), so the pending-write figure stays 0 and `closeLinger`/flush time is spent by the
+  kernel, not by the host. A custom host implements `MqttHost` (plus `HostDriver`, `MqttTransport`, ...), which is
+  experimental API marked `@MqttCoreApi` and may change; the contract suite `MqttHostContractTest` in `commonTest` is
+  the yardstick for a new one.
 - The `clock` parameter of the common factory is accepted but the time comes from the host loop.
 - A client that closes itself keeps its thread until `close()` is called.
 
@@ -554,7 +570,8 @@ The broker never publishes the will after an orderly close.
   `webSocketPort` (with `TLSSettings` that port speaks `wss`), see `WebSocketBrokerTest.kt`. Enhanced authentication
   tests give the broker `enhancedAuthenticationProviders`, see `EnhancedAuthBrokerTest.kt`.
 - Run the module's tests from the fork's root with `./gradlew :kmqtt-client:jvmTest` (when the fork is included in a larger
-  build, the path is prefixed by the included build, for example `:kmqtt:kmqtt-client:jvmTest`).
+  build, the path is prefixed by the included build, for example `:kmqtt:kmqtt-client:jvmTest`). The host contract and
+  the Node/WinSock hosts are tested by `jsNodeTest` (Gradle downloads Node.js) and `mingwX64Test` (on Windows).
 
 ### Differences from the blocking `MQTTClient`
 
@@ -566,6 +583,7 @@ The broker never publishes the will after an orderly close.
 | Subscriptions | `subscribe`/`unsubscribe` calls | declarative groups, restored after reconnect |
 | Publication result | none | `Sent`/`Delivered`/`Expired`/`Failed` |
 | Incoming | callback | ordered `Flow` with back pressure and session epochs |
+| Hosts | every target | JVM, Node.js, mingwX64 |
 | WebSocket | yes | yes (JVM) |
 | Enhanced auth | yes (with re-authentication) | yes (MQTT 5, without re-authentication) |
 
