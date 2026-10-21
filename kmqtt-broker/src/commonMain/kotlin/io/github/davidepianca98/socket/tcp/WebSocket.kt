@@ -96,8 +96,9 @@ internal class WebSocket(private val socket: Socket) : SocketInterface {
     }
 
     private fun decodeClose(length: ULong, key: UByteArray): UByteArray? {
-        decodeBinary(length, key)
-        send(UByteArray(0), 0x8)
+        val payload = decodeBinary(length, key)
+        // RFC 6455 5.5.1: в ответ - кадр закрытия, обычно с тем же кодом состояния (первые два байта тела)
+        send(if (payload.size >= 2) payload.copyOfRange(0, 2) else UByteArray(0), 0x8)
         return null
     }
 
@@ -106,13 +107,23 @@ internal class WebSocket(private val socket: Socket) : SocketInterface {
         return null
     }
 
+    /** Идёт сообщение, разбитое на фрагменты: кадр без FIN принят, продолжение ещё нет (RFC 6455 5.4). */
+    private var fragmented = false
+
+    private fun protocolError(message: String): Nothing {
+        close()
+        throw IOException(message)
+    }
+
     private fun decode(data: UByteArray): UByteArray? {
         currentReceivedData.write(data)
         val out = ByteArrayOutputStream()
         try {
             while (true) {
                 val byte1 = currentReceivedData.read()
-                //val fin = (byte1 and 0x80u) == 0x80.toUByte()
+                val fin = (byte1 and 0x80u) == 0x80.toUByte()
+                // Расширения не согласовывались, биты RSV1-3 должны быть нулевыми (RFC 6455 5.2)
+                if ((byte1 and 0x70u) != 0.toUByte()) protocolError("RSV bits must be 0")
 
                 val opcode = byte1 and 0x0Fu
 
@@ -125,14 +136,28 @@ internal class WebSocket(private val socket: Socket) : SocketInterface {
                 val length = getLength(byte2)
                 val key = currentReceivedData.readBytes(4)
 
+                // Управляющие кадры не фрагментируются и короче 126 байт (RFC 6455 5.5)
+                if (opcode >= 0x8u && (!fin || length > 125uL)) protocolError("Invalid control frame")
+
+                // Состояние фрагментации меняется только после того, как кадр прочитан целиком (иначе повторный
+                // разбор неполного кадра после EOFException увидел бы его дважды)
                 val decoded = when (opcode.toInt()) {
-                    0x2 -> decodeBinary(length, key)
+                    // MQTT - поток байт, границы кадров не важны: продолжение отдаётся так же, как двоичный кадр
+                    0x0 -> {
+                        if (!fragmented) protocolError("Unexpected continuation frame")
+                        decodeBinary(length, key).also { fragmented = !fin }
+                    }
+                    0x2 -> {
+                        if (fragmented) protocolError("Data frame inside a fragmented message")
+                        decodeBinary(length, key).also { fragmented = !fin }
+                    }
                     0x8 -> decodeClose(length, key)
                     0x9 -> decodePing(length, key)
-                    else -> {
-                        close()
-                        throw IOException("Opcode must be 0x2")
+                    0xA -> {
+                        decodeBinary(length, key) // pong без запроса допустим и игнорируется (RFC 6455 5.5.3)
+                        null
                     }
+                    else -> protocolError("Opcode must be 0x0, 0x2, 0x8, 0x9 or 0xA")
                 }
                 decoded?.let { out.write(decoded) }
             }
@@ -161,6 +186,7 @@ internal class WebSocket(private val socket: Socket) : SocketInterface {
     override fun close() {
         val out = ByteArrayOutputStream()
         out.write(0x88u) // fin and opcode 8
+        out.write(0u) // без тела: кадр закрытия из двух байт (RFC 6455 5.5.1)
         try {
             socket.send(out.toByteArray())
         } catch (_: IOException) {

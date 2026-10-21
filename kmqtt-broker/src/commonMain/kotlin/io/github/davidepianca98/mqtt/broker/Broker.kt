@@ -135,8 +135,18 @@ public class Broker(
             }
         }
 
+        // A message forwarded on an established subscription carries RETAIN = 0 (MQTT 3.1.1 [MQTT-3.3.1-9],
+        // MQTT 5 [MQTT-3.3.1-12]) unless the subscription has Retain As Published set, then the publisher's flag
+        // is kept (MQTT 5 [MQTT-3.3.1-13]). MQTT 3.1.1 subscriptions never have Retain As Published set.
+        // A remote session gets the original flag: the peer broker applies its own subscribers' options.
+        val forwardedRetain = if (session is RemoteSession) {
+            retain
+        } else {
+            retain && subscription.options.retainedAsPublished
+        }
+
         session.publish(
-            retain,
+            forwardedRetain,
             topicName,
             Qos.min(subscription.options.qos, qos),
             dup,

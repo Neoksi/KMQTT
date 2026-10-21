@@ -1,0 +1,25 @@
+# cinterop-описание для klib OpenSSL 3.5 LTS.
+# Используется только скриптом native-build/ (Dockerfile); Apple-цели идут через
+# kmqtt-common/src/nativeInterop/openssl.def и здесь не участвуют.
+# libssl.a и libcrypto.a склеены в libopenssl.a внутри контейнера (см. Dockerfile):
+# порядок объектов внутри одного архива для линковщика не важен.
+# openssl-shim.h — ПОСЛЕДНИЙ в списке: сгенерированные заголовки 3.5 дают типизированные
+# функции стека как макросы (cinterop их не видит), shim возвращает нужные форку
+# четыре функции (sk_X509_INFO_num/value/pop_free, sk_X509_OBJECT_num) как static inline.
+headers = openssl/ssl.h openssl/err.h openssl/bio.h openssl/pem.h openssl/pkcs12.h openssl-shim.h
+headerFilter = openssl/* openssl-shim.h
+package = openssl
+staticLibraries = libopenssl.a
+
+compilerOpts.linux_x64 = -I/build/dist/linux-x86_64/include -I/build
+libraryPaths.linux_x64 = /build/dist/linux-x86_64
+linkerOpts.linux_x64 = -ldl -lpthread
+
+compilerOpts.linux_arm64 = -I/build/dist/linux-aarch64/include -I/build
+libraryPaths.linux_arm64 = /build/dist/linux-aarch64
+linkerOpts.linux_arm64 = -ldl -lpthread
+
+compilerOpts.mingw_x64 = -I/build/dist/mingw64/include -I/build
+libraryPaths.mingw_x64 = /build/dist/mingw64
+# Windows-энтропия OpenSSL 3.x идёт через BCrypt
+linkerOpts.mingw_x64 = -lbcrypt

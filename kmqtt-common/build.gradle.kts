@@ -8,8 +8,8 @@ kotlin {
     explicitApi()
 
     jvm {
-        compilations.all {
-            kotlinOptions.jvmTarget = "1.8"
+        compilerOptions {
+            jvmTarget.set(org.jetbrains.kotlin.gradle.dsl.JvmTarget.JVM_1_8)
         }
     }
     js {
@@ -82,6 +82,26 @@ kotlin {
                 implementation(files("src/nativeInterop/openssl-linux-x64.klib"))
             }
         }
+        // тесты native-сокетов на настоящих сокетах и OpenSSL (TLSSocket). OpenSSL подключён файлом klib
+        // каждой цели и не коммонизован, поэтому общий каталог тестов компилируется в тестах каждой цели отдельно
+        // (запуск: mingwX64Test на Windows, linuxX64Test на Linux/Docker); платформенные мелочи — в TestNet.kt цели.
+        val mingwX64Test by getting {
+            kotlin.srcDir("src/nativeSocketTest/kotlin")
+        }
+        val linuxX64Test by getting {
+            kotlin.srcDir("src/nativeSocketTest/kotlin")
+            kotlin.srcDir("src/posixSocketTest/kotlin")
+        }
+        // Запись в сброшенное соединение не убивает процесс (SIGPIPE): тест на настоящих сокетах, POSIX-цели с тестами
+        // (на Apple запускается на Mac: macOS и симуляторы)
+        val macosArm64Test by getting { kotlin.srcDir("src/posixSocketTest/kotlin") }
+        val macosX64Test by getting { kotlin.srcDir("src/posixSocketTest/kotlin") }
+        val iosSimulatorArm64Test by getting { kotlin.srcDir("src/posixSocketTest/kotlin") }
+        val iosX64Test by getting { kotlin.srcDir("src/posixSocketTest/kotlin") }
+        val tvosSimulatorArm64Test by getting { kotlin.srcDir("src/posixSocketTest/kotlin") }
+        val tvosX64Test by getting { kotlin.srcDir("src/posixSocketTest/kotlin") }
+        val watchosSimulatorArm64Test by getting { kotlin.srcDir("src/posixSocketTest/kotlin") }
+        val watchosX64Test by getting { kotlin.srcDir("src/posixSocketTest/kotlin") }
         val linuxArm64Main by getting {
             dependsOn(posixMain)
             dependencies {

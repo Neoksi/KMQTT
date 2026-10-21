@@ -1,0 +1,945 @@
+package io.github.davidepianca98.client.core
+
+import io.github.davidepianca98.client.DropReason
+import io.github.davidepianca98.client.MqttError
+import io.github.davidepianca98.generateRandomClientId
+import io.github.davidepianca98.mqtt.MQTTException
+import io.github.davidepianca98.mqtt.MQTTVersion
+import io.github.davidepianca98.mqtt.Subscription
+import io.github.davidepianca98.mqtt.packets.ConnectFlags
+import io.github.davidepianca98.mqtt.packets.MQTTPacket
+import io.github.davidepianca98.mqtt.packets.Qos
+import io.github.davidepianca98.mqtt.packets.mqtt.MQTTConnack
+import io.github.davidepianca98.mqtt.packets.mqtt.MQTTDisconnect
+import io.github.davidepianca98.mqtt.packets.mqtt.MQTTPingresp
+import io.github.davidepianca98.mqtt.packets.mqtt.MQTTPuback
+import io.github.davidepianca98.mqtt.packets.mqtt.MQTTPubcomp
+import io.github.davidepianca98.mqtt.packets.mqtt.MQTTPubrec
+import io.github.davidepianca98.mqtt.packets.mqtt.MQTTPubrel
+import io.github.davidepianca98.mqtt.packets.mqtt.MQTTSuback
+import io.github.davidepianca98.mqtt.packets.mqtt.MQTTUnsuback
+import io.github.davidepianca98.mqtt.packets.mqttv4.ConnectReturnCode
+import io.github.davidepianca98.mqtt.packets.mqttv4.MQTT4Connack
+import io.github.davidepianca98.mqtt.packets.mqttv4.MQTT4Connect
+import io.github.davidepianca98.mqtt.packets.mqttv4.MQTT4Disconnect
+import io.github.davidepianca98.mqtt.packets.mqttv4.MQTT4Pingreq
+import io.github.davidepianca98.mqtt.packets.mqttv4.MQTT4Puback
+import io.github.davidepianca98.mqtt.packets.mqttv4.MQTT4Pubcomp
+import io.github.davidepianca98.mqtt.packets.mqttv4.MQTT4Publish
+import io.github.davidepianca98.mqtt.packets.mqttv4.MQTT4Pubrec
+import io.github.davidepianca98.mqtt.packets.mqttv4.MQTT4Pubrel
+import io.github.davidepianca98.mqtt.packets.mqttv4.MQTT4Suback
+import io.github.davidepianca98.mqtt.packets.mqttv4.MQTT4Subscribe
+import io.github.davidepianca98.mqtt.packets.mqttv4.MQTT4Unsubscribe
+import io.github.davidepianca98.mqtt.packets.mqttv4.SubackReturnCode
+import io.github.davidepianca98.mqtt.packets.mqttv4.toReasonCode
+import io.github.davidepianca98.mqtt.packets.mqttv5.MQTT5Auth
+import io.github.davidepianca98.mqtt.packets.mqttv5.MQTT5Connack
+import io.github.davidepianca98.mqtt.packets.mqttv5.MQTT5Connect
+import io.github.davidepianca98.mqtt.packets.mqttv5.MQTT5Disconnect
+import io.github.davidepianca98.mqtt.packets.mqttv5.MQTT5Pingreq
+import io.github.davidepianca98.mqtt.packets.mqttv5.MQTT5Properties
+import io.github.davidepianca98.mqtt.packets.mqttv5.MQTT5Puback
+import io.github.davidepianca98.mqtt.packets.mqttv5.MQTT5Pubcomp
+import io.github.davidepianca98.mqtt.packets.mqttv5.MQTT5Publish
+import io.github.davidepianca98.mqtt.packets.mqttv5.MQTT5Pubrec
+import io.github.davidepianca98.mqtt.packets.mqttv5.MQTT5Pubrel
+import io.github.davidepianca98.mqtt.packets.mqttv5.MQTT5Suback
+import io.github.davidepianca98.mqtt.packets.mqttv5.MQTT5Subscribe
+import io.github.davidepianca98.mqtt.packets.mqttv5.MQTT5Unsuback
+import io.github.davidepianca98.mqtt.packets.mqttv5.MQTT5Unsubscribe
+import io.github.davidepianca98.mqtt.packets.mqttv5.ReasonCode
+import io.github.davidepianca98.mqtt.packets.mqttv5.SubscriptionOptions
+
+/**
+ * Протокольное ядро одного MQTT-подключения без ввода-вывода: байты ⇄ пакеты ⇄ события.
+ *
+ * Контракт:
+ * - Новый экземпляр на **каждое** подключение (алиасы, packetId, неподтверждённые — поля экземпляра).
+ * - Однопоточное: все методы вызываются с одного потока (цикла хоста). Замков нет.
+ * - Время — только параметр `nowMs` (монотонные миллисекунды хоста); ядро не читает часы, не логирует, не делает
+ *   ввода-вывода и не выделяет буферов больше лимита пакета ([MqttFramer]).
+ * - Хост: после транспортного подключения — [start]; прочитанные байты — [onBytes]; EOF — [onEof]; по
+ *   [nextDeadline] — [onTick]; после каждого вызова — записать [takeOutbound]. По [CoreOutput.Closed] — дописать
+ *   остаток [takeOutbound] без ожидания и закрыть соединение.
+ *
+ * Поведение (перенос `MQTTClient.kt`):
+ * - CONNECT 3.1.1/5; в MQTT 5 — Maximum Packet Size = [SessionSettings.maxIncomingPacket], Receive Maximum
+ *   (если ≠ 65535), Topic Alias Maximum (если > 0), для will — пустые `willProperties`.
+ * - CONNACK ≠ успех (любой код, в т. ч. `SERVER_MOVED`/`USE_ANOTHER_SERVER` с `serverReference`) →
+ *   `Closed(Refused(code))` без перехода (H10). `serverKeepAlive` применяется. Любой пакет брокера до CONNACK,
+ *   повторный CONNACK, `sessionPresent` при `cleanStart` → `Closed(Protocol(PROTOCOL_ERROR))`.
+ * - keepAlive: PINGREQ, когда с последней отправки прошло 0,9·keepAlive или брокер молчит
+ *   keepAlive; ответ (любой входящий байт) ждём ½·keepAlive → `Closed(KeepAliveTimeout)`. Пока чтение на паузе
+ *   ([setReadPaused]) PINGREQ уходит каждые 0,9·keepAlive от последней отправки, таймаут ответа не считается;
+ *   после снятия паузы отсчёт ответа и молчания начинается заново.
+ * - Входящий QoS 1: PUBACK ставится в исходящие при выдаче [CoreOutput.Message]. QoS 2 — как в старом клиенте
+ *   (PUBREC, повтор по packetId не выдаётся, PUBREL → PUBCOMP; неизвестный PUBREL — `PACKET_IDENTIFIER_NOT_FOUND`).
+ * - Отброшенный фреймером PUBLISH подтверждается: QoS 1 — PUBACK (`SUCCESS`), QoS 2 — PUBREC (`SUCCESS`, id
+ *   запоминается для PUBCOMP); без packetId (не успел прочитаться) подтвердить нечем — известный предел.
+ * - Topic Alias (MQTT 5): алиас > объявленного максимума (в т. ч. при максимуме 0) → `Protocol(TOPIC_ALIAS_INVALID)`;
+ *   неизвестный алиас без топика → `Protocol(PROTOCOL_ERROR)`. Если фреймер отбросил PUBLISH как
+ *   `TopicTooLong` при объявленном максимуме > 0, такой PUBLISH мог задавать (или перепривязывать) алиас: таблица
+ *   алиасов очищается целиком (иначе старая привязка доставила бы сообщения под чужим топиком), а дальнейшие
+ *   PUBLISH с неизвестным алиасом без топика подтверждаются и выдаются как `Dropped(TopicTooLong(length = -1, ...))`
+ *   (−1 — длина неизвестна), пока брокер не пришлёт алиас с топиком заново.
+ * - Ошибка протокола (в т. ч. от фреймера) → в MQTT 5 в исходящие кладётся DISCONNECT с кодом ошибки (will брокер
+ *   опубликует: код ≠ 0), в 3.1.1 — ничего (DISCONNECT 3.1.1 отменил бы will); затем `Closed(Protocol(code))`.
+ * - DISCONNECT брокера (любой код) → `Closed(ServerDisconnect(code))`; в 3.1.1 (брокер его не шлёт) — код `SUCCESS`.
+ * - Расширенная аутентификация MQTT 5 ([SessionSettings.auth]): CONNECT несёт Authentication Method и
+ *   Authentication Data ([SessionAuth.initialData], вызывается в [start]). Входящий AUTH 0x18 (CONTINUE_AUTHENTICATION)
+ *   с тем же методом до CONNACK → [CoreOutput.AuthChallenge]; ответ хоста — [authResponse] (AUTH 0x18 с методом и
+ *   данными) или [authFailed]. Обмен многошаговый, завершается CONNACK: успех — метод в CONNACK обязан совпасть с
+ *   настроенным (иначе `Protocol(PROTOCOL_ERROR)`, MQTT 5 §4.12 [MQTT-4.12.0-5]); отказ брокера (0x87 NOT_AUTHORIZED,
+ *   0x8C BAD_AUTHENTICATION_METHOD и др.) → `Closed(Refused(code))`. Срок всего обмена — `connackTimeoutMs` от CONNECT:
+ *   брокер молчит → `Closed(ConnackTimeout)`; не ответил сам клиент (вызов ждёт [authResponse]) → DISCONNECT 0x87 и
+ *   `Closed(Refused(NOT_AUTHORIZED))`, как и при [authFailed] (MQTT 5 §4.12 разрешает DISCONNECT до CONNACK). Нарушения
+ *   → `Protocol(PROTOCOL_ERROR)`: AUTH без настроенного метода, с другим методом, с кодом SUCCESS/RE_AUTHENTICATE, второй
+ *   AUTH до ответа клиента, AUTH после CONNACK вне обмена повторной аутентификации. В 3.1.1 AUTH нет:
+ *   [SessionSettings] с `auth` не создаётся, входящий AUTH — ошибка протокола (фреймер). Данные успешного CONNACK
+ *   (Authentication Data, например server-final SCRAM) ядро отдаёт на проверку [SessionAuth.verifyConnack];
+ *   без неё не проверяет.
+ * - Повторная аутентификация посреди сессии (re-authentication, MQTT 5 §4.12.1): начинается только клиентом —
+ *   [reauthenticate] в `Connected` отправляет AUTH 0x19 (RE_AUTHENTICATE) с тем же методом и свежими данными
+ *   [SessionAuth.initialData]. Дальше обмен как до CONNACK: AUTH 0x18 брокера → [CoreOutput.AuthChallenge], ответ —
+ *   [authResponse]/[authFailed]; конец — AUTH 0x00 (SUCCESS) брокера с тем же методом → [CoreOutput.Reauthenticated],
+ *   его Authentication Data проверяет [SessionAuth.verifyConnack], как данные CONNACK. Срок всего обмена —
+ *   `connackTimeoutMs` от вызова [reauthenticate]: брокер молчит → `Closed(ConnackTimeout)`; не ответил сам клиент →
+ *   DISCONNECT 0x87 и `Closed(Refused(NOT_AUTHORIZED))`. AUTH 0x19 от брокера (повторную аутентификацию начинает только
+ *   клиент) и любой AUTH в `Connected` вне такого обмена → `Protocol(PROTOCOL_ERROR)`.
+ *
+ * Отличия от `MQTTClient` (сознательные):
+ * - Проверки `requestProblemInformation == 0` не переносятся: ядро это свойство не отправляет (по умолчанию 1),
+ *   так что у старого клиента они тоже не срабатывали.
+ * - Проверка «QoS входящего PUBLISH ≤ Maximum QoS брокера» не переносится: Maximum QoS ограничивает публикации
+ *   клиента, а не брокера (QoS входящих задаёт подписка).
+ * - Публикация до CONNACK не копится в ядре (`Rejected(NotConnected)`): оффлайн-очередь — в движке.
+ * - packetId не пересекается с ожидающими SUBSCRIBE/UNSUBSCRIBE (старый клиент их не учитывал).
+ * - Ядро живёт одно подключение и само ничего не досылает. Продолжение сессии (`cleanStart = false`, Session Present
+ *   = 1) ведёт движок: резервирует packetId ([reservePacketIds]), досылает PUBLISH с DUP = 1
+ *   ([resendPublish]) и PUBREL ([resendPubrel]), переносит входящие QoS 2 ([incomingQos2] → [carryIncomingQos2] до
+ *   подключения; ядро применяет их при CONNACK с Session Present = 1, раньше пакетов, пришедших за CONNACK в том же
+ *   чтении).
+ *   При `cleanStart = false` неизвестный PUBREL получает PUBCOMP (MQTT 5 — `PACKET_IDENTIFIER_NOT_FOUND`) без разрыва;
+ *   при `cleanStart = true` это по-прежнему ошибка протокола.
+ * - MQTT 5: при [SessionSettings.sessionExpiryIntervalSec] ≠ null в CONNECT уходит Session Expiry Interval.
+ */
+@MqttCoreApi
+public class MqttSessionCore(private val settings: SessionSettings, nowMs: Long) {
+
+    /** Текущее состояние подключения. */
+    public var state: CoreState = CoreState.Connecting
+        private set
+
+    private val mqtt5 = settings.version == MQTTVersion.MQTT5
+    private val framer = MqttFramer(settings.version, settings.maxIncomingPacket, settings.maxTopicLength)
+    private val outbound = ArrayList<ByteArray>()
+    private var started = false
+
+    // Время
+    private var connackDeadline = 0L
+    private var lingerDeadline = 0L
+    private var keepAliveMs = settings.keepAliveSec * 1000L
+    private var lastSentMs = nowMs
+    private var lastReceivedMs = nowMs
+    private var pingSentMs: Long? = null
+    private var readPaused = false
+
+    // Свойства сервера (CONNACK)
+    private var serverReceiveMaximum = 65_535
+    private var serverMaximumQos = Qos.EXACTLY_ONCE
+    private var serverRetainAvailable = true
+    private var serverMaximumPacketSize = Int.MAX_VALUE
+
+    // Сессия этого подключения
+    private var lastPacketId = 0
+    private val pendingAck = HashMap<Int, Qos>() // исходящие QoS ≥ 1, ждут PUBACK/PUBREC
+    private val pendingPubcomp = HashSet<Int>() // исходящие QoS 2, ждут PUBCOMP
+    private val pendingSubscriptions = HashSet<Int>() // SUBSCRIBE/UNSUBSCRIBE, ждут SUBACK/UNSUBACK
+    private val qos2Received = HashSet<Int>() // входящие QoS 2, ждут PUBREL
+    private var carriedQos2: Set<Int> = emptySet() // входящие QoS 2 прошлого подключения, до CONNACK
+    private val reserved = HashSet<Int>() // packetId публикаций прошлого подключения, ждущих досылки
+    private val topicAliases = HashMap<Int, String>()
+    private var aliasesLost = false
+
+    // Расширенная аутентификация: выдан AuthChallenge, ждём authResponse/authFailed
+    private var authAwaitingResponse = false
+
+    // Повторная аутентификация посреди сессии: обмен AUTH 0x19 ↔ 0x18/0x00 активен, срок — reauthDeadline
+    private var reauthActive = false
+    private var reauthDeadline = 0L
+
+    /** Отправляет CONNECT. Вызывается один раз, когда транспорт подключён. */
+    public fun start(nowMs: Long): List<CoreOutput> {
+        check(!started) { "start() already called" }
+        started = true
+        if (state != CoreState.Connecting) return emptyList()
+        connackDeadline = nowMs + settings.connackTimeoutMs
+        lastReceivedMs = nowMs
+        val authData = settings.auth?.let { auth ->
+            try {
+                auth.initialData()
+            } catch (_: Exception) {
+                // Текст исключения может содержать секрет — не сохраняется (H11)
+                return closeWith(MqttError.Refused(ReasonCode.NOT_AUTHORIZED))
+            }
+        }
+        enqueue(buildConnect(authData), nowMs)
+        return emptyList()
+    }
+
+    /** Байты, прочитанные из транспорта. В `Closing` читаются и отбрасываются, после `Closed` игнорируются. */
+    public fun onBytes(bytes: ByteArray, off: Int, len: Int, nowMs: Long): List<CoreOutput> {
+        when (state) {
+            CoreState.Closed, CoreState.Closing -> return emptyList()
+            CoreState.Connecting -> check(started) { "onBytes() before start()" }
+            CoreState.Connected -> Unit
+        }
+        if (len == 0) return emptyList()
+        // Любой байт от брокера — признак живого соединения (PINGRESP в том числе)
+        lastReceivedMs = nowMs
+        pingSentMs = null
+        val out = ArrayList<CoreOutput>(4)
+        try {
+            for (frame in framer.feed(bytes, off, len)) {
+                if (state != CoreState.Connecting && state != CoreState.Connected) break
+                when (frame) {
+                    is FramerOutput.Packet -> handlePacket(frame.packet, nowMs, out)
+                    is FramerOutput.Publish -> handlePublish(frame.publish, nowMs, out)
+                    is FramerOutput.Dropped -> handleDropped(frame, nowMs, out)
+                }            }
+        } catch (e: MQTTException) {
+            if (state == CoreState.Connecting || state == CoreState.Connected) failProtocol(e.reasonCode, nowMs, out)
+        }
+        return out
+    }
+
+    /**
+     * Транспорт закрыт брокером (EOF). В `Closing` — штатный конец (`Closed(null)`), иначе — `Closed(Io("eof"))`.
+     */
+    public fun onEof(nowMs: Long): List<CoreOutput> = when (state) {
+        CoreState.Closed -> emptyList()
+        CoreState.Closing -> closeWith(null)
+        CoreState.Connecting, CoreState.Connected -> closeWith(MqttError.Io("eof", null))
+    }
+
+    /**
+     * Ответ на [CoreOutput.AuthChallenge]: AUTH 0x18 (CONTINUE_AUTHENTICATION) с методом [SessionAuth.method] и
+     * Authentication Data [data] (`null` — без неё). Вне ожидания ответа (вызов уже отвечен, CONNACK пришёл, подключение
+     * кончилось) — ничего: поздний ответ прошлого вызова отбрасывается.
+     */
+    public fun authResponse(data: ByteArray?, nowMs: Long): List<CoreOutput> {
+        if (state != CoreState.Connecting && state != CoreState.Connected) return emptyList()
+        if (!authAwaitingResponse) return emptyList()
+        val auth = settings.auth ?: return emptyList()
+        authAwaitingResponse = false
+        val properties = MQTT5Properties(authenticationMethod = auth.method, authenticationData = data?.asUByteArray())
+        enqueue(MQTT5Auth(ReasonCode.CONTINUE_AUTHENTICATION, properties).toByteArray().asByteArray(), nowMs)
+        return emptyList()
+    }
+
+    /**
+     * Клиент не может ответить на [CoreOutput.AuthChallenge] (провайдер отказал или упал): DISCONNECT 0x87 и
+     * `Closed(Refused(NOT_AUTHORIZED))`. Вне ожидания ответа — ничего.
+     */
+    public fun authFailed(nowMs: Long): List<CoreOutput> {
+        if (state != CoreState.Connecting && state != CoreState.Connected) return emptyList()
+        if (!authAwaitingResponse) return emptyList()
+        return failAuth(nowMs)
+    }
+
+    /** Можно ли начать повторную аутентификацию ([reauthenticate]): `Connected`, настроен `auth`, другого обмена нет. */
+    public val reauthAvailable: Boolean
+        get() = state == CoreState.Connected && settings.auth != null && !reauthActive
+
+    /**
+     * Начать повторную аутентификацию (re-authentication, MQTT 5 §4.12.1): AUTH 0x19 (RE_AUTHENTICATE) с
+     * методом [SessionAuth.method] и свежими Authentication Data ([SessionAuth.initialData] вызывается заново, на
+     * потоке хоста; исключение — DISCONNECT 0x87 и `Closed(Refused(NOT_AUTHORIZED))`, как в [start]). Дальше обмен как
+     * до CONNACK: AUTH 0x18 брокера → [CoreOutput.AuthChallenge], ответ — [authResponse]/[authFailed]; конец — AUTH
+     * 0x00 брокера → [CoreOutput.Reauthenticated] (его данные проверяет [SessionAuth.verifyConnack]). Срок всего
+     * обмена — `connackTimeoutMs` от этого вызова ([onTick]). Только когда [reauthAvailable], иначе
+     * `IllegalStateException` (движок проверяет перед вызовом).
+     */
+    public fun reauthenticate(nowMs: Long): List<CoreOutput> {
+        check(reauthAvailable) { "reauthenticate() is not available now" }
+        val auth = settings.auth ?: error("reauthAvailable is false without auth")
+        val data = try {
+            auth.initialData()
+        } catch (_: Exception) {
+            // Текст исключения может содержать секрет — не сохраняется (H11)
+            return failAuth(nowMs)
+        }
+        reauthActive = true
+        reauthDeadline = nowMs + settings.connackTimeoutMs
+        val properties = MQTT5Properties(authenticationMethod = auth.method, authenticationData = data?.asUByteArray())
+        enqueue(MQTT5Auth(ReasonCode.RE_AUTHENTICATE, properties).toByteArray().asByteArray(), nowMs)
+        return emptyList()
+    }
+
+    /**
+     * Публикация. Только в `Connected`; при `inflight ≥ Receive Maximum` брокера — [PublishAdmission.FlowControlled].
+     */
+    public fun publish(p: OutgoingPublish, nowMs: Long): PublishAdmission {
+        if (state != CoreState.Connected) return PublishAdmission.Rejected(PublishRejection.NotConnected)
+        if (!isValidTopic(p.topic)) return PublishAdmission.Rejected(PublishRejection.InvalidTopic)
+        if (p.qos.value > serverMaximumQos.value) return PublishAdmission.Rejected(PublishRejection.QosNotSupported)
+        if (p.retain && !serverRetainAvailable) return PublishAdmission.Rejected(PublishRejection.RetainNotSupported)
+        if (p.qos != Qos.AT_MOST_ONCE && pendingAck.size + pendingPubcomp.size >= serverReceiveMaximum) {
+            return PublishAdmission.FlowControlled
+        }
+        val packetId = if (p.qos != Qos.AT_MOST_ONCE) nextPacketId() else null
+        val data = publishBytes(p, packetId, dup = false, nowMs)
+        if (data.size > serverMaximumPacketSize) {
+            return PublishAdmission.Rejected(PublishRejection.TooLarge(data.size, serverMaximumPacketSize))
+        }
+        if (packetId != null) pendingAck[packetId] = p.qos
+        enqueue(data, nowMs)
+        return PublishAdmission.Accepted(packetId)
+    }
+
+    /**
+     * Досылка неподтверждённой публикации прошлого подключения той же сессии (`cleanStart = false` и
+     * Session Present = 1 в CONNACK): PUBLISH с DUP = 1 и прежним [packetId] (MQTT 3.1.1 §4.4, MQTT 5 §4.4). Только
+     * в `Connected` и только QoS ≥ 1; [packetId] не должен быть занят (резерв [reservePacketIds] снимается). Проверки —
+     * как у [publish] (QoS, retain, размер, окно Receive Maximum брокера → [PublishAdmission.FlowControlled]).
+     * Решение «досылать ли» (TTL, признак «не досылать») — у движка.
+     */
+    public fun resendPublish(p: OutgoingPublish, packetId: Int, nowMs: Long): PublishAdmission {
+        require(p.qos != Qos.AT_MOST_ONCE) { "QoS 0 is never re-sent" }
+        require(packetId in 1..MAX_PACKET_ID) { "packetId out of 1..65535" }
+        if (state != CoreState.Connected) return PublishAdmission.Rejected(PublishRejection.NotConnected)
+        check(packetId !in pendingAck && packetId !in pendingPubcomp && packetId !in pendingSubscriptions) {
+            "packetId in use"
+        }
+        if (!isValidTopic(p.topic)) return PublishAdmission.Rejected(PublishRejection.InvalidTopic)
+        if (p.qos.value > serverMaximumQos.value) return PublishAdmission.Rejected(PublishRejection.QosNotSupported)
+        if (p.retain && !serverRetainAvailable) return PublishAdmission.Rejected(PublishRejection.RetainNotSupported)
+        if (pendingAck.size + pendingPubcomp.size >= serverReceiveMaximum) return PublishAdmission.FlowControlled
+        val data = publishBytes(p, packetId, dup = true, nowMs)
+        if (data.size > serverMaximumPacketSize) {
+            return PublishAdmission.Rejected(PublishRejection.TooLarge(data.size, serverMaximumPacketSize))
+        }
+        reserved -= packetId
+        pendingAck[packetId] = p.qos
+        enqueue(data, nowMs)
+        return PublishAdmission.Accepted(packetId)
+    }
+
+    /**
+     * Досылка PUBREL исходящей QoS 2, на которую в прошлом подключении той же сессии пришёл PUBREC: ответ
+     * — [CoreOutput.PubAck] по PUBCOMP. Только в `Connected`; [packetId] не должен быть занят (резерв снимается).
+     */
+    public fun resendPubrel(packetId: Int, nowMs: Long) {
+        check(state == CoreState.Connected) { "resendPubrel() in state $state" }
+        check(packetId !in pendingAck && packetId !in pendingPubcomp && packetId !in pendingSubscriptions) {
+            "packetId in use"
+        }
+        reserved -= packetId
+        pendingPubcomp += packetId
+        val pubrel = if (mqtt5) MQTT5Pubrel(packetId.toUInt()) else MQTT4Pubrel(packetId.toUInt())
+        enqueue(pubrel.toByteArray().asByteArray(), nowMs)
+    }
+
+    /**
+     * Зарезервировать packetId неподтверждённых публикаций прошлого подключения, которые ждут досылки:
+     * новые PUBLISH/SUBSCRIBE/UNSUBSCRIBE их не берут, пока движок не дошлёт ([resendPublish], [resendPubrel]) или не
+     * откажется от досылки ([releasePacketId]).
+     */
+    public fun reservePacketIds(ids: Collection<Int>) {
+        reserved += ids
+    }
+
+    /** Снять резерв [reservePacketIds] с [packetId]: публикация не будет дослана. */
+    public fun releasePacketId(packetId: Int) {
+        reserved -= packetId
+    }
+
+    /** packetId исходящих QoS 2, на которые пришёл PUBREC и ждётся PUBCOMP (снимок для досылки PUBREL). */
+    public fun awaitingPubcomp(): Set<Int> = HashSet(pendingPubcomp)
+
+    /**
+     * packetId входящих QoS 2, на которые отправлен PUBREC и ждётся PUBREL (снимок): в следующем подключении той же
+     * сессии повтор PUBLISH с этим id не выдаётся второй раз ([restoreIncomingQos2]).
+     */
+    public fun incomingQos2(): Set<Int> = HashSet(qos2Received)
+
+    /**
+     * Состояние входящих QoS 2 прошлого подключения той же сессии ([incomingQos2]) — до CONNACK: ядро
+     * применяет его при разборе успешного CONNACK с Session Present = 1 (при `cleanStart = false`), раньше пакетов,
+     * пришедших в том же чтении за CONNACK (брокер досылает PUBLISH с DUP = 1 и PUBREL сразу за ним). Session
+     * Present = 0 — отбрасывается. Только в `Connecting`; повторный вызов заменяет набор.
+     */
+    public fun carryIncomingQos2(ids: Collection<Int>) {
+        check(state == CoreState.Connecting) { "carryIncomingQos2() in state $state" }
+        carriedQos2 = HashSet(ids)
+    }
+
+    /**
+     * Добавить состояние входящих QoS 2 после CONNACK. Пакеты, уже разобранные в том же чтении, его не видят —
+     * движок передаёт состояние до подключения ([carryIncomingQos2]).
+     */
+    public fun restoreIncomingQos2(ids: Collection<Int>) {
+        qos2Received += ids
+    }
+
+    private fun publishBytes(p: OutgoingPublish, packetId: Int?, dup: Boolean, nowMs: Long): ByteArray {
+        val id = packetId?.toUInt()
+        val payload = p.payload.asUByteArray()
+        // timestamp передаётся явно: значение по умолчанию у kmqtt-common читает системные часы
+        val packet = if (mqtt5) {
+            MQTT5Publish(p.retain, p.qos, dup, p.topic, id, MQTT5Properties(), payload, nowMs)
+        } else {
+            MQTT4Publish(p.retain, p.qos, dup, p.topic, id, payload, nowMs)
+        }
+        return packet.toByteArray().asByteArray()
+    }
+
+    /**
+     * SUBSCRIBE; возвращает packetId (ответ — [CoreOutput.SubAck]). Только в `Connected`, иначе
+     * `IllegalStateException` (движок подписывается после [CoreOutput.Connected]). Разбивка на порции — в движке.
+     */
+    public fun subscribe(filters: List<SubscriptionRequest>, nowMs: Long): Int {
+        check(state == CoreState.Connected) { "subscribe() in state $state" }
+        require(filters.isNotEmpty()) { "no filters" }
+        val packetId = nextPacketId()
+        val subscriptions = filters.map { Subscription(it.filter, SubscriptionOptions(it.qos)) }
+        val packet = if (mqtt5) {
+            MQTT5Subscribe(packetId.toUInt(), subscriptions)
+        } else {
+            MQTT4Subscribe(packetId.toUInt(), subscriptions)
+        }
+        val data = packet.toByteArray().asByteArray()
+        pendingSubscriptions += packetId
+        enqueue(data, nowMs)
+        return packetId
+    }
+
+    /** UNSUBSCRIBE; возвращает packetId (ответ — [CoreOutput.UnsubAck]). Только в `Connected`. */
+    public fun unsubscribe(filters: List<String>, nowMs: Long): Int {
+        check(state == CoreState.Connected) { "unsubscribe() in state $state" }
+        require(filters.isNotEmpty()) { "no filters" }
+        val packetId = nextPacketId()
+        val packet = if (mqtt5) {
+            MQTT5Unsubscribe(packetId.toUInt(), filters)
+        } else {
+            MQTT4Unsubscribe(packetId.toUInt(), filters)
+        }
+        val data = packet.toByteArray().asByteArray()
+        pendingSubscriptions += packetId
+        enqueue(data, nowMs)
+        return packetId
+    }
+
+    /**
+     * Штатное закрытие: DISCONNECT ([reason] — только MQTT 5) в исходящие и состояние `Closing`: входящее
+     * читается и отбрасывается до EOF ([onEof] → `Closed(null)`) или дедлайна `closeLingerMs` ([onTick] →
+     * `Closed(null)`). При `closeLingerMs = 0` — `Closed(null)` сразу (DISCONNECT остаётся в [takeOutbound]).
+     * До [start] — `Closed(null)` без DISCONNECT. В `Closing`/`Closed` — ничего.
+     */
+    public fun disconnect(reason: ReasonCode, nowMs: Long): List<CoreOutput> {
+        when (state) {
+            CoreState.Closing, CoreState.Closed -> return emptyList()
+            CoreState.Connecting -> if (!started) return closeWith(null)
+            CoreState.Connected -> Unit
+        }
+        val packet = if (mqtt5) MQTT5Disconnect(reason) else MQTT4Disconnect()
+        enqueue(packet.toByteArray().asByteArray(), nowMs)
+        state = CoreState.Closing
+        lingerDeadline = nowMs + settings.closeLingerMs
+        return if (settings.closeLingerMs == 0L) closeWith(null) else emptyList()
+    }
+
+    /** Таймауты: CONNACK, keepAlive (PINGREQ и ожидание ответа), linger закрытия. */
+    public fun onTick(nowMs: Long): List<CoreOutput> {
+        when (state) {
+            CoreState.Closed -> return emptyList()
+            CoreState.Connecting -> {
+                if (started && nowMs >= connackDeadline) {
+                    // Срок вышел, пока ответа ждали от самого клиента: это его отказ, а не молчание брокера
+                    return if (authAwaitingResponse) failAuth(nowMs) else closeWith(MqttError.ConnackTimeout)
+                }
+                return emptyList()
+            }
+            CoreState.Closing -> return if (nowMs >= lingerDeadline) closeWith(null) else emptyList()
+            CoreState.Connected -> if (reauthActive && nowMs >= reauthDeadline) {
+                // Срок обмена вышел: ответа ждали от самого клиента — его отказ; молчание брокера — как тишина CONNACK
+                return if (authAwaitingResponse) failAuth(nowMs) else closeWith(MqttError.ConnackTimeout)
+            }
+        }
+        if (keepAliveMs == 0L) return emptyList()
+        val responseDeadline = pingResponseDeadline()
+        if (responseDeadline != null && nowMs >= responseDeadline) return closeWith(MqttError.KeepAliveTimeout)
+        if (nowMs >= nextPingAt()) {
+            enqueue((if (mqtt5) PINGREQ_5 else PINGREQ_4).copyOf(), nowMs)
+            pingSentMs = nowMs
+        }
+        return emptyList()
+    }
+
+    /** Ближайший момент, когда нужен [onTick]: CONNACK, keepAlive, linger или срок повторной аутентификации; null — не нужен. */
+    public fun nextDeadline(): Long? = when (state) {
+        CoreState.Closed -> null
+        CoreState.Connecting -> if (started) connackDeadline else null
+        CoreState.Closing -> lingerDeadline
+        CoreState.Connected -> {
+            var result = if (keepAliveMs == 0L) {
+                null
+            } else {
+                val ping = nextPingAt()
+                val response = pingResponseDeadline()
+                if (response != null && response < ping) response else ping
+            }
+            if (reauthActive && (result == null || reauthDeadline < result)) result = reauthDeadline
+            result
+        }
+    }
+
+    /** Всё, что нужно записать в транспорт (пакеты подряд), или null. */
+    public fun takeOutbound(): ByteArray? {
+        if (outbound.isEmpty()) return null
+        val result = if (outbound.size == 1) {
+            outbound[0]
+        } else {
+            val total = outbound.sumOf { it.size }
+            val joined = ByteArray(total)
+            var pos = 0
+            for (chunk in outbound) {
+                chunk.copyInto(joined, pos)
+                pos += chunk.size
+            }
+            joined
+        }
+        outbound.clear()
+        return result
+    }
+
+    /**
+     * Обратное давление: хост перестал (или снова начал) читать транспорт. На паузе PINGREQ уходит по
+     * расписанию, таймаут ответа не считается; при снятии паузы отсчёт ответа и молчания брокера — заново от [nowMs].
+     */
+    public fun setReadPaused(paused: Boolean, nowMs: Long) {
+        if (paused == readPaused) return
+        readPaused = paused
+        if (!paused) {
+            lastReceivedMs = nowMs
+            if (pingSentMs != null) pingSentMs = nowMs
+        }
+    }
+
+    // ---- keepAlive ----
+
+    private fun nextPingAt(): Long {
+        val bySent = lastSentMs + keepAliveMs * 9 / 10
+        return when {
+            readPaused -> bySent
+            pingSentMs != null -> Long.MAX_VALUE // ждём ответа на отправленный PINGREQ
+            else -> minOf(bySent, lastReceivedMs + keepAliveMs)
+        }
+    }
+
+    private fun pingResponseDeadline(): Long? {
+        val ping = pingSentMs ?: return null
+        return if (readPaused) null else ping + keepAliveMs / 2
+    }
+
+    // ---- входящие ----
+
+    private fun handlePacket(packet: MQTTPacket, nowMs: Long, out: MutableList<CoreOutput>) {
+        if (packet is MQTTConnack) {
+            handleConnack(packet, nowMs, out)
+            return
+        }
+        if (packet is MQTT5Auth) {
+            handleAuth(packet, nowMs, out)
+            return
+        }
+        if (state != CoreState.Connected) throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+        when (packet) {
+            is MQTTPuback -> {
+                val id = packet.packetId.toInt()
+                if (pendingAck.remove(id) != null) {
+                    out += CoreOutput.PubAck(id, (packet as? MQTT5Puback)?.reasonCode ?: ReasonCode.SUCCESS)
+                }
+            }
+            is MQTTPubrec -> {
+                val id = packet.packetId.toInt()
+                val code = (packet as? MQTT5Pubrec)?.reasonCode ?: ReasonCode.SUCCESS
+                val wasPending = pendingAck.remove(id) != null
+                if (code.value >= 0x80) {
+                    // Брокер отказал в QoS 2: поток завершён, PUBREL не отправляется
+                    if (wasPending) out += CoreOutput.PubAck(id, code)
+                } else {
+                    pendingPubcomp += id
+                    val pubrel = if (mqtt5) MQTT5Pubrel(packet.packetId) else MQTT4Pubrel(packet.packetId)
+                    enqueue(pubrel.toByteArray().asByteArray(), nowMs)
+                }
+            }
+            is MQTTPubrel -> {
+                val known = qos2Received.remove(packet.packetId.toInt())
+                if (!known && !settings.cleanStart) {
+                    // Сессия продолжается: брокер досылает PUBREL, состояние которого клиент не сохранил
+                    // (например, новый экземпляр клиента с тем же clientId) — завершить поток, а не рвать подключение:
+                    // ошибка повторялась бы на каждом переподключении
+                    val pubcomp = if (mqtt5) {
+                        MQTT5Pubcomp(packet.packetId, ReasonCode.PACKET_IDENTIFIER_NOT_FOUND)
+                    } else {
+                        MQTT4Pubcomp(packet.packetId)
+                    }
+                    enqueue(pubcomp.toByteArray().asByteArray(), nowMs)
+                    return
+                }
+                val pubcomp = if (mqtt5) MQTT5Pubcomp(packet.packetId) else MQTT4Pubcomp(packet.packetId)
+                enqueue(pubcomp.toByteArray().asByteArray(), nowMs)
+                if (!known) throw MQTTException(ReasonCode.PACKET_IDENTIFIER_NOT_FOUND)
+            }
+            is MQTTPubcomp -> {
+                val id = packet.packetId.toInt()
+                if (!pendingPubcomp.remove(id)) throw MQTTException(ReasonCode.PACKET_IDENTIFIER_NOT_FOUND)
+                out += CoreOutput.PubAck(id, (packet as? MQTT5Pubcomp)?.reasonCode ?: ReasonCode.SUCCESS)
+            }
+            is MQTTSuback -> {
+                val id = packet.packetIdentifier.toInt()
+                pendingSubscriptions -= id
+                val codes = when (packet) {
+                    is MQTT5Suback -> packet.reasonCodes
+                    is MQTT4Suback -> packet.reasonCodes.map { it.toReason() }
+                    else -> emptyList()
+                }
+                out += CoreOutput.SubAck(id, codes)
+            }
+            is MQTTUnsuback -> {
+                val id = packet.packetIdentifier.toInt()
+                pendingSubscriptions -= id
+                out += CoreOutput.UnsubAck(id, (packet as? MQTT5Unsuback)?.reasonCodes ?: emptyList())
+            }
+            is MQTTPingresp -> Unit // отметка «брокер жив» уже сделана в onBytes
+            is MQTTDisconnect -> {
+                val code = (packet as? MQTT5Disconnect)?.reasonCode ?: ReasonCode.SUCCESS
+                out += closeWith(MqttError.ServerDisconnect(code))
+            }
+            else -> throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+        }
+    }
+
+    /**
+     * AUTH брокера. До CONNACK — только 0x18 с настроенным методом, не во время ожидания ответа
+     * клиента. В `Connected` — только в активном обмене повторной аутентификации ([reauthenticate]): 0x18 — очередной
+     * вызов, 0x00 (SUCCESS) — конец ([CoreOutput.Reauthenticated]; данные проверяет [SessionAuth.verifyConnack], как
+     * данные CONNACK). Всё прочее — ошибка протокола, в т. ч. 0x19 от брокера (повторную аутентификацию начинает
+     * только клиент, MQTT 5 §4.12.1) и любой AUTH в `Connected` вне обмена.
+     */
+    private fun handleAuth(packet: MQTT5Auth, nowMs: Long, out: MutableList<CoreOutput>) {
+        val auth = settings.auth ?: throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+        if (packet.properties.authenticationMethod != auth.method) throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+        when (state) {
+            CoreState.Connecting -> {
+                if (authAwaitingResponse) throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+                if (packet.authenticateReasonCode != ReasonCode.CONTINUE_AUTHENTICATION) {
+                    throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+                }
+                authAwaitingResponse = true
+                out += CoreOutput.AuthChallenge(auth.method, packet.properties.authenticationData?.asByteArray())
+            }
+            CoreState.Connected -> {
+                if (!reauthActive || authAwaitingResponse) throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+                when (packet.authenticateReasonCode) {
+                    ReasonCode.CONTINUE_AUTHENTICATION -> {
+                        authAwaitingResponse = true
+                        out += CoreOutput.AuthChallenge(auth.method, packet.properties.authenticationData?.asByteArray())
+                    }
+                    ReasonCode.SUCCESS -> {
+                        // Подлинность брокера: данные успеха (например server-final SCRAM) — проверкой
+                        val verify = auth.verifyConnack
+                        if (verify != null) {
+                            val genuine = try {
+                                verify(packet.properties.authenticationData?.asByteArray())
+                            } catch (_: Throwable) {
+                                false // текст исключения не сохраняется (H11)
+                            }
+                            if (!genuine) {
+                                out += failAuth(nowMs)
+                                return
+                            }
+                        }
+                        reauthActive = false
+                        out += CoreOutput.Reauthenticated
+                    }
+                    else -> throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+                }
+            }
+            else -> throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+        }
+    }
+
+    private fun handleConnack(packet: MQTTConnack, nowMs: Long, out: MutableList<CoreOutput>) {
+        if (state != CoreState.Connecting) throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+        authAwaitingResponse = false
+        val info: ConnackInfo
+        when (packet) {
+            is MQTT5Connack -> {
+                if (packet.connectReasonCode != ReasonCode.SUCCESS) {
+                    // Любой отказ, в т. ч. SERVER_MOVED/USE_ANOTHER_SERVER: без перехода на serverReference (H10)
+                    out += closeWith(MqttError.Refused(packet.connectReasonCode))
+                    return
+                }
+                val props = packet.properties
+                // MQTT 5 §4.12 [MQTT-4.12.0-5]: успешный CONNACK несёт тот же Authentication Method, что CONNECT
+                val auth = settings.auth
+                if (auth != null && props.authenticationMethod != auth.method) {
+                    throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+                }
+                // подлинность брокера - проверка данных успешного CONNACK (например, подписи сервера SCRAM)
+                val verify = auth?.verifyConnack
+                if (verify != null) {
+                    val genuine = try {
+                        verify(props.authenticationData?.asByteArray())
+                    } catch (_: Throwable) {
+                        false // текст исключения не сохраняется (H11)
+                    }
+                    if (!genuine) {
+                        out += failAuth(nowMs)
+                        return
+                    }
+                }
+                val receiveMaximum = props.receiveMaximum?.toLong() ?: 65_535L
+                if (receiveMaximum == 0L) throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+                val maximumQos = props.maximumQos?.let {
+                    Qos.valueOf(it.toInt()) ?: throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+                } ?: Qos.EXACTLY_ONCE
+                info = ConnackInfo(
+                    sessionPresent = packet.connectAcknowledgeFlags.sessionPresentFlag,
+                    serverKeepAliveSec = props.serverKeepAlive?.toInt(),
+                    receiveMaximum = receiveMaximum.coerceAtMost(65_535L).toInt(),
+                    maximumQos = maximumQos,
+                    retainAvailable = props.retainAvailable?.let { it != 0u } ?: true,
+                    maximumPacketSize = props.maximumPacketSize?.let { it.toLong().coerceAtMost(Int.MAX_VALUE.toLong()).toInt() },
+                    assignedClientId = props.assignedClientIdentifier,
+                    topicAliasMaximum = props.topicAliasMaximum?.toInt() ?: 0,
+                )
+            }
+            is MQTT4Connack -> {
+                if (packet.connectReturnCode != ConnectReturnCode.CONNECTION_ACCEPTED) {
+                    out += closeWith(MqttError.Refused(packet.connectReturnCode.toReasonCode()))
+                    return
+                }
+                info = ConnackInfo(
+                    sessionPresent = packet.connectAcknowledgeFlags.sessionPresentFlag,
+                    serverKeepAliveSec = null,
+                    receiveMaximum = 65_535,
+                    maximumQos = Qos.EXACTLY_ONCE,
+                    retainAvailable = true,
+                    maximumPacketSize = null,
+                    assignedClientId = null,
+                    topicAliasMaximum = 0,
+                )
+            }
+            else -> throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+        }
+        if (settings.cleanStart && info.sessionPresent) throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+
+        serverReceiveMaximum = info.receiveMaximum
+        serverMaximumQos = info.maximumQos
+        serverRetainAvailable = info.retainAvailable
+        serverMaximumPacketSize = info.maximumPacketSize ?: Int.MAX_VALUE
+        info.serverKeepAliveSec?.let { keepAliveMs = it * 1000L }
+        // состояние входящих QoS 2 продолжаемой сессии — до пакетов, идущих за CONNACK в том же чтении
+        if (info.sessionPresent && !settings.cleanStart) qos2Received += carriedQos2
+        carriedQos2 = emptySet()
+        state = CoreState.Connected
+        out += CoreOutput.Connected(info)
+    }
+
+    private fun handlePublish(publish: IncomingPublish, nowMs: Long, out: MutableList<CoreOutput>) {
+        if (state != CoreState.Connected) throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+        var topic = publish.topic
+        val alias = publish.topicAlias
+        if (alias != null) {
+            if (alias > settings.topicAliasMaximum) throw MQTTException(ReasonCode.TOPIC_ALIAS_INVALID)
+            if (topic.isNotEmpty()) {
+                topicAliases[alias] = topic
+            } else {
+                val known = topicAliases[alias]
+                if (known == null) {
+                    if (!aliasesLost) throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+                    // Алиас мог быть задан PUBLISH, отброшенным как TopicTooLong: топик неизвестен
+                    acknowledgeDropped(publish.packetId, publish.qos, nowMs)
+                    out += CoreOutput.Dropped(DropReason.TopicTooLong(-1, settings.maxTopicLength))
+                    return
+                }
+                topic = known
+            }
+        }
+        val packetId = publish.packetId
+        when (publish.qos) {
+            Qos.AT_MOST_ONCE -> out += CoreOutput.Message(topic, publish.payload, publish.qos, publish.retain)
+            Qos.AT_LEAST_ONCE -> {
+                val id = packetId ?: throw MQTTException(ReasonCode.MALFORMED_PACKET)
+                out += CoreOutput.Message(topic, publish.payload, publish.qos, publish.retain)
+                enqueue(puback(id), nowMs)
+            }
+            Qos.EXACTLY_ONCE -> {
+                val id = packetId ?: throw MQTTException(ReasonCode.MALFORMED_PACKET)
+                val fresh = id !in qos2Received
+                if (fresh && qos2Received.size >= settings.receiveMaximum) {
+                    throw MQTTException(ReasonCode.RECEIVE_MAXIMUM_EXCEEDED)
+                }
+                enqueue(pubrec(id), nowMs)
+                if (fresh) {
+                    qos2Received += id
+                    out += CoreOutput.Message(topic, publish.payload, publish.qos, publish.retain)
+                }
+            }
+        }
+    }
+
+    private fun handleDropped(dropped: FramerOutput.Dropped, nowMs: Long, out: MutableList<CoreOutput>) {
+        if (state != CoreState.Connected) throw MQTTException(ReasonCode.PROTOCOL_ERROR)
+        if (dropped.reason is DropReason.TopicTooLong && mqtt5 && settings.topicAliasMaximum > 0) {
+            // Отброшенный PUBLISH мог задать или перепривязать алиас: старые привязки больше не достоверны
+            topicAliases.clear()
+            aliasesLost = true
+        }
+        acknowledgeDropped(dropped.packetId, dropped.qos, nowMs)
+        out += CoreOutput.Dropped(dropped.reason)
+    }
+
+    /** Подтверждает отброшенный PUBLISH, чтобы у брокера не закрывалось окно неподтверждённых. */
+    private fun acknowledgeDropped(packetId: Int?, qos: Qos?, nowMs: Long) {
+        if (packetId == null) return
+        when (qos) {
+            Qos.AT_LEAST_ONCE -> enqueue(puback(packetId), nowMs)
+            Qos.EXACTLY_ONCE -> {
+                qos2Received += packetId
+                enqueue(pubrec(packetId), nowMs)
+            }
+            else -> Unit
+        }
+    }
+
+    // ---- служебное ----
+
+    private fun buildConnect(authData: ByteArray?): ByteArray {
+        val will = settings.will
+        val credentials = settings.credentials
+        val login = credentials?.login
+        val password = credentials?.password?.asUByteArray()
+        val flags = ConnectFlags(
+            login != null,
+            password != null,
+            will?.retain ?: false,
+            will?.qos ?: Qos.AT_MOST_ONCE,
+            will != null,
+            settings.cleanStart,
+            false,
+        )
+        val clientId = settings.clientId ?: generateRandomClientId()
+        val packet = if (mqtt5) {
+            val properties = MQTT5Properties(
+                sessionExpiryInterval = settings.sessionExpiryIntervalSec?.toUInt(),
+                maximumPacketSize = settings.maxIncomingPacket.toUInt(),
+                receiveMaximum = settings.receiveMaximum.takeIf { it != 65_535 }?.toUInt(),
+                topicAliasMaximum = settings.topicAliasMaximum.takeIf { it > 0 }?.toUInt(),
+                authenticationMethod = settings.auth?.method,
+                authenticationData = authData?.asUByteArray(),
+            )
+            MQTT5Connect(
+                "MQTT",
+                flags,
+                settings.keepAliveSec,
+                clientId,
+                properties,
+                if (will != null) MQTT5Properties() else null,
+                will?.topic,
+                will?.payload?.asUByteArray(),
+                login,
+                password,
+            )
+        } else {
+            MQTT4Connect(
+                "MQTT",
+                flags,
+                settings.keepAliveSec,
+                clientId,
+                will?.topic,
+                will?.payload?.asUByteArray(),
+                login,
+                password,
+            )
+        }
+        return packet.toByteArray().asByteArray()
+    }
+
+    private fun puback(id: Int): ByteArray =
+        (if (mqtt5) MQTT5Puback(id.toUInt()) else MQTT4Puback(id.toUInt())).toByteArray().asByteArray()
+
+    private fun pubrec(id: Int): ByteArray =
+        (if (mqtt5) MQTT5Pubrec(id.toUInt()) else MQTT4Pubrec(id.toUInt())).toByteArray().asByteArray()
+
+    private fun enqueue(data: ByteArray, nowMs: Long) {
+        outbound += data
+        lastSentMs = nowMs
+    }
+
+    private fun nextPacketId(): Int {
+        repeat(MAX_PACKET_ID) {
+            lastPacketId = lastPacketId % MAX_PACKET_ID + 1
+            val id = lastPacketId
+            if (id !in pendingAck && id !in pendingPubcomp && id !in pendingSubscriptions && id !in reserved) return id
+        }
+        throw IllegalStateException("no free packet identifier")
+    }
+
+    /** Отказ клиента в расширенной аутентификации: DISCONNECT 0x87 (кладётся после перехода) и `Refused(NOT_AUTHORIZED)`. */
+    private fun failAuth(nowMs: Long): List<CoreOutput> {
+        authAwaitingResponse = false
+        reauthActive = false
+        val closed = closeWith(MqttError.Refused(ReasonCode.NOT_AUTHORIZED))
+        enqueue(MQTT5Disconnect(ReasonCode.NOT_AUTHORIZED).toByteArray().asByteArray(), nowMs)
+        return closed
+    }
+
+    private fun failProtocol(code: ReasonCode, nowMs: Long, out: MutableList<CoreOutput>) {
+        val closed = closeWith(MqttError.Protocol(code))
+        if (mqtt5) {
+            // DISCONNECT с кодом ≠ 0: брокер публикует will, как при обрыве. В 3.1.1 DISCONNECT отменил бы will.
+            enqueue(MQTT5Disconnect(code).toByteArray().asByteArray(), nowMs)
+        }
+        out += closed
+    }
+
+    /**
+     * Переход в `Closed` (один раз). Штатное закрытие сохраняет исходящие (DISCONNECT ещё может быть не записан),
+     * при ошибке они отбрасываются: соединение закрывается сразу.
+     */
+    private fun closeWith(error: MqttError?): List<CoreOutput> {
+        if (state == CoreState.Closed) return emptyList()
+        state = CoreState.Closed
+        if (error != null) outbound.clear()
+        return listOf(CoreOutput.Closed(error))
+    }
+
+    private fun isValidTopic(topic: String): Boolean {
+        if (topic.isEmpty()) return false
+        if (topic.indexOf('+') >= 0 || topic.indexOf('#') >= 0 || topic.indexOf('\u0000') >= 0) return false
+        return topic.length <= MAX_TOPIC_CHARS_FAST || topic.encodeToByteArray().size <= MAX_STRING_BYTES
+    }
+
+    private fun SubackReturnCode.toReason(): ReasonCode = when (this) {
+        SubackReturnCode.MAXIMUM_QOS0 -> ReasonCode.SUCCESS
+        SubackReturnCode.MAXIMUM_QOS1 -> ReasonCode.GRANTED_QOS1
+        SubackReturnCode.MAXIMUM_QOS2 -> ReasonCode.GRANTED_QOS2
+        SubackReturnCode.FAILURE -> ReasonCode.UNSPECIFIED_ERROR
+    }
+
+    private companion object {
+        const val MAX_PACKET_ID = 65_535
+        const val MAX_STRING_BYTES = 65_535
+
+        /** Строка не длиннее этого числа символов заведомо ≤ 65535 байт UTF-8 (≤ 3 байта на символ UTF-16). */
+        const val MAX_TOPIC_CHARS_FAST = MAX_STRING_BYTES / 3
+
+        val PINGREQ_4: ByteArray = MQTT4Pingreq().toByteArray().asByteArray()
+        val PINGREQ_5: ByteArray = MQTT5Pingreq().toByteArray().asByteArray()
+    }
+}

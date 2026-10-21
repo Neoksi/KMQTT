@@ -5,33 +5,45 @@ import platform.posix.*
 import io.github.davidepianca98.socket.IOException
 import io.github.davidepianca98.socket.tcp.Socket
 
-public actual class ClientSocket actual constructor(
-    address: String,
-    port: Int,
+/**
+ * TCP-сокет старого клиента на native. Семейство сокета — по разрешённому адресу: IPv4 предпочтительно,
+ * IPv6 — если IPv4 у имени нет или это литерал (`::1`, `[::1]`).
+ */
+public actual class ClientSocket private constructor(
+    target: NativeSocketTarget,
     maximumPacketSize: Int,
     private val readTimeOut: Int,
-    private val connectTimeOut: Int,
-    checkCallback: () -> Unit
+    private val connectTimeOut: Int
 ) : Socket(
-    socketsInit().run {
-        socket(AF_INET, SOCK_STREAM, 0)
-    },
+    target.openSocket(),
     null,
     ByteArray(maximumPacketSize)
 ) {
+
+    public actual constructor(
+        address: String,
+        port: Int,
+        maximumPacketSize: Int,
+        readTimeOut: Int,
+        connectTimeOut: Int,
+        checkCallback: () -> Unit
+    ) : this(NativeSocketTarget.resolve(address, port), maximumPacketSize, readTimeOut, connectTimeOut)
 
     private val readfds = nativeHeap.alloc<fd_set>()
 
     init {
         memScoped {
-            val ipLen = getaddrinfo(address, port.toString()) ?: throw IOException("Failed resolving address")
+            if (socket == -1) {
+                socketsCleanup()
+                throw IOException("Invalid socket, error ${getErrno()}")
+            }
 
             if (set_send_socket_timeout(socket, connectTimeOut.convert()) == -1) {
                 socketsCleanup()
                 throw IOException("Socket connect timeout set failed, error ${getErrno()}")
             }
 
-            if (connect(socket, ipLen.first, ipLen.second) == -1) {
+            if (target.connectTo(socket) == -1) {
                 socketsCleanup()
                 throw IOException("Socket connect failed, error ${getErrno()}")
             }

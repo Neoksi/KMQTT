@@ -5,7 +5,7 @@ import kotlinx.cinterop.CPointer
 import io.github.davidepianca98.socket.tls.TLSClientSettings
 import io.github.davidepianca98.socket.tls.TLSEngine
 
-internal expect class TLSClientEngine(tlsSettings: TLSClientSettings) : TLSEngine {
+internal expect class TLSClientEngine(tlsSettings: TLSClientSettings, host: String) : TLSEngine {
 
     override val isInitFinished: Boolean
     override val bioShouldRetry: Boolean

@@ -7,7 +7,7 @@ allprojects {
 
 buildscript {
     dependencies {
-        classpath("org.jetbrains.kotlinx:atomicfu-gradle-plugin:0.27.0")
+        classpath("org.jetbrains.kotlinx:atomicfu-gradle-plugin:0.33.0")
     }
 }
 
@@ -18,5 +18,5 @@ plugins {
 
 subprojects {
     group = "io.github.davidepianca98"
-    version = "1.0.0"
+    version = "1.0.0-SNAPSHOT"
 }

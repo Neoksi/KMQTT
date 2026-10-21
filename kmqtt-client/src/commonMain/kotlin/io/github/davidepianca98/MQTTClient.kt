@@ -64,9 +64,12 @@ import io.github.davidepianca98.socket.tls.TLSClientSettings
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.yield
+import kotlin.concurrent.Volatile
 
 /**
  * MQTT 3.1.1 and 5 client
+ *
+ * Legacy: new code uses `io.github.davidepianca98.client.MqttClient`.
  *
  * @param autoInit if true then the Connection will be automatically initialized after creation, otherwise you should call MQTTClient init manually, default value is true
  * @param mqttVersion sets the version of MQTT for this client MQTTVersion.MQTT3_1_1 or MQTTVersion.MQTT5
@@ -87,12 +90,16 @@ import kotlinx.coroutines.yield
  * @param willQos the QoS of the will PUBLISH message
  * @param connackTimeout timeout in seconds after which the connection is closed if no CONNACK packet has been received
  * @param connectTimeout timeout in seconds after which an exception will be thrown if the socket is not able to establish a connection
+ * @param readTimeout how long in milliseconds one step() waits for data from the server (keep alive and CONNACK timeouts are checked once per step); wakeup() ends the wait earlier
  * @param enhancedAuthCallback the callback called when authenticationData is received, it should return the data necessary to continue authentication or null if completed (used only in MQTT5 if authenticationMethod has been set in the CONNECT properties)
  * @param onConnected called when the CONNACK packet has been received and the connection has been established
  * @param onDisconnected called when a DISCONNECT packet has been received or if the connection has been terminated
- * @param onSubscribed called when a SUBACK packet has been received
+ * @param onSubscribed called when a SUBACK packet has been received (with failSessionOnSubackError = false: only when every subscription of it has been granted)
  * @param onUnsubscribed called when a UNSUBACK packet has been received
  * @param debugLog set to print the hex packets sent and received
+ * @param failSessionOnSubackError if true (default) a SUBACK refusing any subscription closes the connection and step() throws MQTTException; if false the connection stays open and onSubscribeFailed is called instead
+ * @param onSubscribeFailed called (only with failSessionOnSubackError = false) when a SUBACK refuses at least one subscription; its reason codes are in the order of the SUBSCRIBE topic filters
+ * @param onPublishAcknowledged called when a PUBACK acknowledges a QoS 1 PUBLISH sent by this client (its packetId is the one returned by publish()); in MQTT5 a reason code >= 0x80 means the server refused the message
  * @param publishReceived called when a PUBLISH packet has been received
  */
 public class MQTTClient(
@@ -114,6 +121,7 @@ public class MQTTClient(
     private val willQos: Qos = Qos.AT_MOST_ONCE,
     private val connackTimeout: Int = 30,
     private val connectTimeout: Int = 30,
+    private val readTimeout: Int = 250,
     private val autoInit: Boolean = true,
     private val enhancedAuthCallback: (authenticationData: UByteArray?) -> UByteArray? = { null },
     private val onConnected: (connack: MQTTConnack) -> Unit = {},
@@ -121,12 +129,16 @@ public class MQTTClient(
     private val onSubscribed: (suback: MQTTSuback) -> Unit = {},
     private val onUnsubscribed: (unsuback: MQTTUnsuback) -> Unit = {},
     private val debugLog: Boolean = false,
+    private val failSessionOnSubackError: Boolean = true,
+    private val onSubscribeFailed: (suback: MQTTSuback) -> Unit = {},
+    private val onPublishAcknowledged: (puback: MQTTPuback) -> Unit = {},
     private val publishReceived: (publish: MQTTPublish) -> Unit
 ) {
 
     private val initialized: AtomicBoolean = atomic(false)
 
     private val maximumPacketSize = properties.maximumPacketSize?.toInt() ?: (1024 * 1024)
+    @Volatile
     private var socket: SocketInterface? = null
     private val running: AtomicBoolean = atomic(false)
 
@@ -134,6 +146,9 @@ public class MQTTClient(
 
     private val currentReceivedPacket = MQTTCurrentPacket(maximumPacketSize.toUInt(), mqttVersion)
     private val lastActiveTimestamp = atomic(currentTimeMillis())
+    // Keep alive: last packet received from the server and the PINGREQ awaiting an answer (0 if none)
+    private val lastReceivedTimestamp = atomic(currentTimeMillis())
+    private val pingSentTimestamp = atomic(0L)
 
     // Session
     private var packetIdentifier: UInt = 1u
@@ -183,7 +198,7 @@ public class MQTTClient(
             initialized.getAndSet(true)
             running.getAndSet(true)
 
-            connectSocket(250, connectTimeout * 1000)
+            connectSocket(readTimeout, connectTimeout * 1000)
         }
     }
 
@@ -203,6 +218,14 @@ public class MQTTClient(
     }
 
     public fun isInitialized(): Boolean = initialized.value
+
+    /**
+     * Ends the wait for data of a step() in progress (or of the next one), so that the thread running the client
+     * sends at once what other threads have queued for it. The only method safe to call from any thread.
+     */
+    public fun wakeup() {
+        socket?.wakeup()
+    }
 
     public fun isRunning(): Boolean = running.value
 
@@ -297,8 +320,9 @@ public class MQTTClient(
      * @param topic the topic of the message
      * @param payload the content of the message
      * @param properties the properties to be included in the message (used only in MQTT5)
+     * @return the packet Id (QoS 1 and 2: acknowledged by onPublishAcknowledged for QoS 1), null for QoS 0
      */
-    public fun publish(retain: Boolean, qos: Qos, topic: String, payload: UByteArray?, properties: MQTT5Properties = MQTT5Properties()) {
+    public fun publish(retain: Boolean, qos: Qos, topic: String, payload: UByteArray?, properties: MQTT5Properties = MQTT5Properties()): UInt? {
         if (!connackReceived.value && properties.authenticationData != null) {
             throw Exception("Not sending until connection complete")
         }
@@ -333,6 +357,7 @@ public class MQTTClient(
             throw Exception("Packet size too big for the server to handle")
         }
         send(data)
+        return packetId
     }
 
     /**
@@ -380,16 +405,41 @@ public class MQTTClient(
     /**
      * Disconnect the client
      *
+     * After the DISCONNECT the client waits for the server to close the connection (the server must do it) and
+     * discards what it still sends, and only then closes the socket. Closing a socket whose receive buffer holds unread
+     * replies (PUBACK, SUBACK, UNSUBACK of the last packets) makes the operating system send RST instead of FIN: the
+     * broker then loses the not yet processed tail of the stream, including this DISCONNECT, sees a dropped connection
+     * and publishes the will.
+     *
      * @param reasonCode the specific reason code (only used in MQTT5)
+     * @param lingerMs how long to wait for the server to close the connection before closing the socket anyway;
+     * 0 closes the socket at once. The wait is done by the calling thread, the one that runs the client loop
      */
-    public fun disconnect(reasonCode: ReasonCode) {
+    public fun disconnect(reasonCode: ReasonCode, lingerMs: Long = DISCONNECT_LINGER_MS) {
         val disconnect = if (mqttVersion == MQTTVersion.MQTT3_1_1) {
             MQTT4Disconnect()
         } else {
             MQTT5Disconnect(reasonCode)
         }
         send(disconnect.toByteArray())
+        if (lingerMs > 0) {
+            awaitServerClose(lingerMs)
+        }
         close()
+    }
+
+    // Reads and discards until the server closes the connection or the time is up; any failure ends the wait
+    private fun awaitServerClose(lingerMs: Long) {
+        val deadline = currentTimeMillis() + lingerMs
+        try {
+            while (currentTimeMillis() < deadline) {
+                val current = socket ?: return
+                current.sendRemaining()
+                current.read()
+            }
+        } catch (_: Exception) {
+            // The server closed the connection (end of stream) or the read failed: nothing left to wait for
+        }
     }
 
     private var lastException: Exception? = null
@@ -420,6 +470,9 @@ public class MQTTClient(
         }
 
         if (data != null) {
+            // Any packet from the server proves the connection is alive (PINGRESP included)
+            lastReceivedTimestamp.getAndSet(currentTimeMillis())
+            pingSentTimestamp.getAndSet(0L)
             try {
                 if (debugLog) {
                     println("Received: " + data.toHexString())
@@ -429,7 +482,7 @@ public class MQTTClient(
                 }
             } catch (e: MQTTException) {
                 lastException = e
-                disconnect(e.reasonCode)
+                disconnect(e.reasonCode, 0)
                 onDisconnected(null)
                 throw e
             } catch (e: EOFException) {
@@ -439,12 +492,12 @@ public class MQTTClient(
                 throw e
             } catch (e: IOException) {
                 lastException = e
-                disconnect(ReasonCode.UNSPECIFIED_ERROR)
+                disconnect(ReasonCode.UNSPECIFIED_ERROR, 0)
                 onDisconnected(null)
                 throw e
             } catch (e: Exception) {
                 lastException = e
-                disconnect(ReasonCode.IMPLEMENTATION_SPECIFIC_ERROR)
+                disconnect(ReasonCode.IMPLEMENTATION_SPECIFIC_ERROR, 0)
                 onDisconnected(null)
                 throw e
             }
@@ -461,21 +514,27 @@ public class MQTTClient(
             throw lastException!!
         }
 
+        // Sending (PINGREQ included) refreshes lastActive, so a timeout based on it never fires and a half-open
+        // connection is never detected: wait for an answer to the PINGREQ instead
         val actualKeepAlive = keepAlive.value
         if (actualKeepAlive != 0 && isConnackReceived) {
-            if (currentTime > lastActive + (actualKeepAlive * 1000)) {
-                // Timeout
-                close()
-                lastException = MQTTException(ReasonCode.KEEP_ALIVE_TIMEOUT)
-                throw lastException!!
-            } else if (currentTime > lastActive + (actualKeepAlive * 1000 * 0.9)) {
+            val keepAliveMs = actualKeepAlive * 1000L
+            val pingSent = pingSentTimestamp.value
+            if (pingSent != 0L) {
+                if (currentTime > pingSent + keepAliveMs / 2) {
+                    // No PINGRESP (nor any other packet) in half of the keep alive interval
+                    close()
+                    lastException = MQTTException(ReasonCode.KEEP_ALIVE_TIMEOUT)
+                    throw lastException!!
+                }
+            } else if (currentTime > lastActive + (keepAliveMs * 0.9) || currentTime > lastReceivedTimestamp.value + keepAliveMs) {
                 val pingreq = if (mqttVersion == MQTTVersion.MQTT3_1_1) {
                     MQTT4Pingreq()
                 } else {
                     MQTT5Pingreq()
                 }
                 send(pingreq.toByteArray())
-                // TODO if not receiving pingresp after a reasonable amount of time, close connection
+                pingSentTimestamp.getAndSet(currentTime)
             }
         }
     }
@@ -535,7 +594,7 @@ public class MQTTClient(
                 }
             } finally {
                 if (running.value) {
-                    disconnect(ReasonCode.IMPLEMENTATION_SPECIFIC_ERROR)
+                    disconnect(ReasonCode.IMPLEMENTATION_SPECIFIC_ERROR, 0)
                 }
             }
         }
@@ -561,11 +620,9 @@ public class MQTTClient(
     private fun handleConnack(packet: MQTTConnack) {
         if (packet is MQTT5Connack) {
             if (packet.connectReasonCode != ReasonCode.SUCCESS) {
-                if ((packet.connectReasonCode == ReasonCode.USE_ANOTHER_SERVER || packet.connectReasonCode == ReasonCode.SERVER_MOVED) && packet.properties.serverReference != null) {
-                    // TODO if reason code 0x9C try to connect to the given server (4.11 format)
-                } else {
-                    throw MQTTException(packet.connectReasonCode)
-                }
+                // Any reason code other than SUCCESS refuses the connection: USE_ANOTHER_SERVER/SERVER_MOVED included,
+                // with or without serverReference (the client does not follow redirections)
+                throw MQTTException(packet.connectReasonCode)
             }
 
             val receiveMax = packet.properties.receiveMaximum ?: 65535u
@@ -683,8 +740,11 @@ public class MQTTClient(
         if (packet is MQTT5Puback && properties.requestProblemInformation == 0u && (packet.properties.reasonString != null || packet.properties.userProperty.isNotEmpty())) {
             throw MQTTException(ReasonCode.PROTOCOL_ERROR)
         }
-        lock.withLock {
+        val acknowledged = lock.withLock {
             pendingAcknowledgeMessages.remove(packet.packetId)
+        }
+        if (acknowledged != null) {
+            onPublishAcknowledged(packet)
         }
     }
 
@@ -731,23 +791,27 @@ public class MQTTClient(
     }
 
     private fun handleSuback(packet: MQTTSuback) {
+        var refused: ReasonCode? = null
         if (packet is MQTT4Suback) {
-            for (reasonCode in packet.reasonCodes) {
-                if (reasonCode == SubackReturnCode.FAILURE) {
-                    throw MQTTException(ReasonCode.UNSPECIFIED_ERROR)
-                }
+            if (packet.reasonCodes.any { it == SubackReturnCode.FAILURE }) {
+                refused = ReasonCode.UNSPECIFIED_ERROR
             }
         } else if (packet is MQTT5Suback) {
             if (properties.requestProblemInformation == 0u && (packet.properties.reasonString != null || packet.properties.userProperty.isNotEmpty())) {
                 throw MQTTException(ReasonCode.PROTOCOL_ERROR)
             }
-            for (reasonCode in packet.reasonCodes) {
-                if (reasonCode != ReasonCode.SUCCESS && reasonCode != ReasonCode.GRANTED_QOS1 && reasonCode != ReasonCode.GRANTED_QOS2) {
-                    throw MQTTException(reasonCode)
-                }
+            refused = packet.reasonCodes.firstOrNull {
+                it != ReasonCode.SUCCESS && it != ReasonCode.GRANTED_QOS1 && it != ReasonCode.GRANTED_QOS2
             }
         }
-        onSubscribed(packet)
+        if (refused == null) {
+            onSubscribed(packet)
+        } else if (failSessionOnSubackError) {
+            throw MQTTException(refused)
+        } else {
+            // A refused subscription (e.g. ACL) does not affect the other subscriptions nor the connection
+            onSubscribeFailed(packet)
+        }
     }
 
     private fun handleUnsuback(packet: MQTTUnsuback) {
@@ -807,3 +871,6 @@ public class MQTTClient(
         socket = null
     }
 }
+
+// How long disconnect() waits for the server to close the connection before closing the socket itself
+private const val DISCONNECT_LINGER_MS = 3_000L
