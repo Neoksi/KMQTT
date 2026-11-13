@@ -97,3 +97,11 @@ fabric.properties
 build/
 
 local.properties
+.kotlin/
+
+# Kotlin/JS: lock-файл yarn создаётся сборкой jsNode, не храним, как .kotlin/
+kotlin-js-store/
+
+# Сборка OpenSSL для Apple (native-build/build-apple.sh) и Docker-сборка (native-build/build.sh): промежуточные деревья и артефакты
+native-build/apple/
+native-build/out/

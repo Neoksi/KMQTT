@@ -83,7 +83,15 @@ public actual fun MemScope.getPortFromSockaddrIn(sockaddr: sockaddr_in): UShort 
 }
 
 public actual fun setsockopt(__fd: Int, __level: Int, __optname: Int, __optval: CValuesRef<*>?, __optlen: UInt): Int {
-    return platform.posix.setsockopt(__fd.convert(), __level, __optname, __optval.toString(), __optlen.convert())
+    // optval — указатель на значение опции (раньше сюда уходил __optval.toString(): текст адреса, а не данные)
+    @Suppress("UNCHECKED_CAST")
+    return platform.posix.setsockopt(
+        __fd.convert(),
+        __level,
+        __optname,
+        __optval as CValuesRef<ByteVar>?,
+        __optlen.toInt()
+    )
 }
 
 public actual fun bind(__fd: Int, __addr: CValuesRef<sockaddr>?, __len: UInt): Int {
@@ -126,8 +134,11 @@ public actual fun MemScope.select(
     timeout: Long
 ): Int {
     val timeoutStruct = alloc<timeval>()
-    timeoutStruct.tv_sec = 0
-    timeoutStruct.tv_usec = (timeout * 1000).toInt()
+    // tv_usec должен быть меньше 1 000 000: целые секунды отдельно (иначе WSAEINVAL при таймауте от секунды)
+    val millis = timeout.coerceAtLeast(0)
+    val seconds = millis / 1000
+    timeoutStruct.tv_sec = seconds.convert()
+    timeoutStruct.tv_usec = ((millis - seconds * 1000) * 1000).convert()
     return platform.windows.select(__nfds, __readfds, __writefds, __exceptfds, timeoutStruct.ptr)
 }
 
@@ -161,21 +172,46 @@ public actual fun MemScope.set_recv_socket_timeout(__fd: Int, timeout: Long): In
     return setsockopt(__fd, SOL_SOCKET, SO_RCVTIMEO, timeoutValue.ptr, sizeOf<uint32_tVar>().toUInt())
 }
 
+/**
+ * Адрес имени [name] для TCP: IPv4 предпочтительно, IPv6 — если IPv4-адресов у имени нет или это литерал
+ * IPv6 (в том числе в скобках, `[::1]`: скобки снимает [hostForResolve]). Семейство полученного адреса —
+ * [addressFamilyOf] по длине. Адрес копируется в память [MemScope] (живёт, пока жив скоуп вызывающего), список
+ * `addrinfo` сразу освобождается `freeaddrinfo`. `null` — имя не разрешилось.
+ */
 public actual fun MemScope.getaddrinfo(name: String, service: String?): Pair<CPointer<sockaddr>, UInt>? {
     val hints = alloc<addrinfo>()
     platform.posix.memset(hints.ptr, 0, sizeOf<addrinfo>().convert())
-    hints.ai_family = platform.posix.AF_INET
+    hints.ai_family = platform.posix.AF_UNSPEC
     hints.ai_socktype = platform.posix.SOCK_STREAM
     hints.ai_protocol = platform.posix.IPPROTO_TCP
     val result = alloc<CPointerVar<addrinfo>>()
-    if (getaddrinfo(name, service, hints.ptr, result.ptr) == 0) {
-        return if (result.pointed != null && result.pointed?.ai_addr != null && result.pointed?.ai_addrlen != null) {
-            Pair(result.pointed?.ai_addr!!, result.pointed?.ai_addrlen!!.toUInt())
-        } else {
-            null
+    result.value = null
+    if (getaddrinfo(hostForResolve(name), service, hints.ptr, result.ptr) != 0) return null
+    val head = result.value ?: return null
+    try {
+        var chosen: addrinfo? = null
+        var node: addrinfo? = head.pointed
+        while (node != null) {
+            val family = node.ai_family
+            val usable = node.ai_addr != null && node.ai_addrlen.toInt() > 0 &&
+                (family == platform.posix.AF_INET || family == platform.posix.AF_INET6)
+            if (usable) {
+                if (family == platform.posix.AF_INET) {
+                    chosen = node
+                    break
+                }
+                if (chosen == null) chosen = node
+            }
+            node = node.ai_next?.pointed
         }
+        val pick = chosen ?: return null
+        val length = pick.ai_addrlen.toInt()
+        val copy = allocArray<ByteVar>(length)
+        platform.posix.memcpy(copy, pick.ai_addr, length.convert())
+        return Pair(copy.reinterpret<sockaddr>(), length.toUInt())
+    } finally {
+        platform.windows.freeaddrinfo(head)
     }
-    return null
 }
 
 public actual fun fdSet(fd: Int, fdSet: CValuesRef<fd_set>) {
@@ -204,4 +240,14 @@ public actual fun gettimeofday(timeval: timeval) {
         timeval.tv_sec  = ((time - epoch) / 10000000UL).toInt()
         timeval.tv_usec = ((time - epoch).rem(10000000UL) / 10u).toInt()
     }
+}
+
+/** `IPPROTO_IPV6` (41) и `IPV6_V6ONLY` (27) WinSock (`ws2def.h`, `ws2ipdef.h`): в привязках mingwX64 их нет. */
+private const val WINSOCK_IPPROTO_IPV6: Int = 41
+private const val WINSOCK_IPV6_V6ONLY: Int = 27
+
+public actual fun MemScope.setIpv6Only(__fd: Int, only: Boolean): Int {
+    val value = alloc<IntVar>()
+    value.value = if (only) 1 else 0
+    return setsockopt(__fd, WINSOCK_IPPROTO_IPV6, WINSOCK_IPV6_V6ONLY, value.ptr, sizeOf<IntVar>().toUInt())
 }

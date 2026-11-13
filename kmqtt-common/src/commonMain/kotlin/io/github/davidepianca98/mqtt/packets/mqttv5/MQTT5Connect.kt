@@ -110,7 +110,8 @@ public class MQTT5Connect(
         outStream.writeUTF8String(clientID)
         try {
             if (connectFlags.willFlag) {
-                outStream.write(willProperties!!.serializeProperties(validWillProperties))
+                // will без willProperties — пустые свойства, а не NPE -> MALFORMED_PACKET
+                outStream.write((willProperties ?: MQTT5Properties()).serializeProperties(validWillProperties))
                 outStream.writeUTF8String(willTopic!!)
                 outStream.writeBinaryData(willPayload!!)
             }

@@ -1,40 +1,62 @@
-headers = openssl/ssl.h openssl/err.h openssl/bio.h openssl/pem.h openssl/pkcs12.h
-headerFilter = openssl/*
+# cinterop-описание klib OpenSSL форка (Apple-цели).
+# Служит для ПЕРЕСБОРКИ klib из исходников OpenSSL; обычная сборка kmqtt идёт против
+# готовых klib из этого каталога (files(...) в kmqtt-common/build.gradle.kts).
+#
+# Воспроизводимые скрипты сборки — libs/kmqtt/native-build/ (OpenSSL 3.5 LTS,
+# sha256 тарбола с openssl.org закреплён в Dockerfile; текущий пин — 3.5.9,
+# 603f5602e2eef00d77fbd429d34dcd5822bb301757a1bc9cdb24c670f1eb859a):
+#  - linuxX64 / linuxArm64 / mingwX64 — Docker (native-build/Dockerfile + build.sh,
+#    своё описание native-build/openssl-3.5.def; этот файл их не покрывает);
+#  - Apple-цели — native-build/build-apple.sh на Mac с полным Xcode (рецепт
+#    промежуточное дерево native-build/apple/ в git не хранится).
+#    klib Apple-целей в репо собраны из OpenSSL 3.5.9 (2026-10-21, Xcode 26.3,
+#    Kotlin/Native 2.4.20): macos/ios/tvos/watchos, все цели этого def.
+#
+# Пути относительны корня форка (libs/kmqtt); cinterop запускается из корня форка
+# (так же, как скрипты native-build/). libssl.a и libcrypto.a склеены ar в libopenssl.a
+# тем же приёмом, что в native-build/Dockerfile; openssl-shim.h — последний в списке
+# headers: 3.5 отдаёт типизированные sk_<T>_* как function-like макросы (cinterop их
+# не индексирует), shim возвращает нужные форку четыре функции как static inline
+# (см. native-build/openssl-shim.h и native-build/openssl-3.5.def).
+#
+# Блоки tvos_*/watchos_*/ios_x64 ниже сохранены: klib этих целей лежат в этом каталоге.
+headers = openssl/ssl.h openssl/err.h openssl/bio.h openssl/pem.h openssl/pkcs12.h openssl-shim.h
+headerFilter = openssl/* openssl-shim.h
 package = openssl
-staticLibraries = libssl.a libcrypto.a
+staticLibraries = libopenssl.a
 
-compilerOpts.macos_x64 = -I/Users/davide/Desktop/openssl/openssl-mac-x64/openssl-1.1.1w/include
-libraryPaths.macos_x64 = /Users/davide/Desktop/openssl/openssl-mac-x64/openssl-1.1.1w
+compilerOpts.macos_x64 = -Inative-build/apple/macos-x64/openssl-3.5.9/include -Inative-build
+libraryPaths.macos_x64 = native-build/apple/macos-x64/openssl-3.5.9
 
-compilerOpts.macos_arm64 = -I/Users/davide/Desktop/openssl/openssl-1.1.1w/include
-libraryPaths.macos_arm64 = /Users/davide/Desktop/openssl/openssl-1.1.1w
+compilerOpts.macos_arm64 = -Inative-build/apple/macos-arm64/openssl-3.5.9/include -Inative-build
+libraryPaths.macos_arm64 = native-build/apple/macos-arm64/openssl-3.5.9
 
-compilerOpts.ios_x64 = -I/Users/davide/Desktop/openssl/OpenSSL-for-iPhone/bin/iPhoneSimulator17.2-x86_64.sdk/include
-libraryPaths.ios_x64 = /Users/davide/Desktop/openssl/OpenSSL-for-iPhone/bin/iPhoneSimulator17.2-x86_64.sdk/lib
+compilerOpts.ios_x64 = -Inative-build/apple/ios-x64/openssl-3.5.9/include -Inative-build
+libraryPaths.ios_x64 = native-build/apple/ios-x64/openssl-3.5.9
 
-compilerOpts.ios_simulator_arm64 = -I/Users/davide/Desktop/openssl/OpenSSL-for-iPhone/bin/iPhoneSimulator17.2-arm64.sdk/include
-libraryPaths.ios_simulator_arm64 = /Users/davide/Desktop/openssl/OpenSSL-for-iPhone/bin/iPhoneSimulator17.2-arm64.sdk/lib
+compilerOpts.ios_simulator_arm64 = -Inative-build/apple/ios-simulator-arm64/openssl-3.5.9/include -Inative-build
+libraryPaths.ios_simulator_arm64 = native-build/apple/ios-simulator-arm64/openssl-3.5.9
 
-compilerOpts.ios_arm64 = -I/Users/davide/Desktop/openssl/OpenSSL-for-iPhone/bin/iPhoneOS17.2-arm64.sdk/include
-libraryPaths.ios_arm64 = /Users/davide/Desktop/openssl/OpenSSL-for-iPhone/bin/iPhoneOS17.2-arm64.sdk/lib
+compilerOpts.ios_arm64 = -Inative-build/apple/ios-arm64/openssl-3.5.9/include -Inative-build
+libraryPaths.ios_arm64 = native-build/apple/ios-arm64/openssl-3.5.9
 
-compilerOpts.tvos_x64 = -I/Users/davide/Desktop/openssl/OpenSSL-for-iPhone/bin/AppleTVSimulator17.2-x86_64.sdk/include
-libraryPaths.tvos_x64 = /Users/davide/Desktop/openssl/OpenSSL-for-iPhone/bin/AppleTVSimulator17.2-x86_64.sdk/lib
+compilerOpts.tvos_x64 = -Inative-build/apple/tvos-x64/openssl-3.5.9/include -Inative-build
+libraryPaths.tvos_x64 = native-build/apple/tvos-x64/openssl-3.5.9
 
-compilerOpts.tvos_simulator_arm64 = -I/Users/davide/Desktop/openssl/OpenSSL-for-iPhone/bin/AppleTVSimulator17.2-arm64.sdk/include
-libraryPaths.tvos_simulator_arm64 = /Users/davide/Desktop/openssl/OpenSSL-for-iPhone/bin/AppleTVSimulator17.2-arm64.sdk/lib
+compilerOpts.tvos_simulator_arm64 = -Inative-build/apple/tvos-simulator-arm64/openssl-3.5.9/include -Inative-build
+libraryPaths.tvos_simulator_arm64 = native-build/apple/tvos-simulator-arm64/openssl-3.5.9
 
-compilerOpts.tvos_arm64 = -I/Users/davide/Desktop/openssl/OpenSSL-for-iPhone/bin/AppleTVOS17.2-arm64.sdk/include
-libraryPaths.tvos_arm64 = /Users/davide/Desktop/openssl/OpenSSL-for-iPhone/bin/AppleTVOS17.2-arm64.sdk/lib
+compilerOpts.tvos_arm64 = -Inative-build/apple/tvos-arm64/openssl-3.5.9/include -Inative-build
+libraryPaths.tvos_arm64 = native-build/apple/tvos-arm64/openssl-3.5.9
 
-compilerOpts.watchos_x64 = -I/Users/davide/Desktop/openssl/OpenSSL-for-iPhone/bin/WatchSimulator10.2-x86_64.sdk/include
-libraryPaths.watchos_x64 = /Users/davide/Desktop/openssl/OpenSSL-for-iPhone/bin/WatchSimulator10.2-x86_64.sdk/lib
+compilerOpts.watchos_x64 = -Inative-build/apple/watchos-x64/openssl-3.5.9/include -Inative-build
+libraryPaths.watchos_x64 = native-build/apple/watchos-x64/openssl-3.5.9
 
-compilerOpts.watchos_simulator_arm64 = -I/Users/davide/Desktop/openssl/OpenSSL-for-iPhone/bin/WatchSimulator10.2-arm64.sdk/include
-libraryPaths.watchos_simulator_arm64 = /Users/davide/Desktop/openssl/OpenSSL-for-iPhone/bin/WatchSimulator10.2-arm64.sdk/lib
+compilerOpts.watchos_simulator_arm64 = -Inative-build/apple/watchos-simulator-arm64/openssl-3.5.9/include -Inative-build
+libraryPaths.watchos_simulator_arm64 = native-build/apple/watchos-simulator-arm64/openssl-3.5.9
 
-compilerOpts.watchos_arm64 = -I/Users/davide/Desktop/openssl/OpenSSL-for-iPhone/bin/WatchOS10.2-arm64_32.sdk/include
-libraryPaths.watchos_arm64 = /Users/davide/Desktop/openssl/OpenSSL-for-iPhone/bin/WatchOS10.2-arm64_32.sdk/lib
+compilerOpts.watchos_arm64 = -Inative-build/apple/watchos-arm64/openssl-3.5.9/include -Inative-build
+libraryPaths.watchos_arm64 = native-build/apple/watchos-arm64/openssl-3.5.9
 
-compilerOpts.watchos_arm32 = -I/Users/davide/Desktop/openssl/OpenSSL-for-iPhone/bin/WatchOS10.2-armv7k.sdk/include
-libraryPaths.watchos_arm32 = /Users/davide/Desktop/openssl/OpenSSL-for-iPhone/bin/WatchOS10.2-armv7k.sdk/lib
+compilerOpts.watchos_arm32 = -Inative-build/apple/watchos-arm32/openssl-3.5.9/include -Inative-build
+libraryPaths.watchos_arm32 = native-build/apple/watchos-arm32/openssl-3.5.9

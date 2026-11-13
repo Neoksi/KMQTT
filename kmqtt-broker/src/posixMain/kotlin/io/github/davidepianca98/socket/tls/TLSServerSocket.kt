@@ -15,10 +15,20 @@ internal actual class TLSServerSocket actual constructor(
 
     private val tlsServerContext = TLSServerContext(broker.tlsSettings!!)
 
+    /** TLS-сокеты клиентов по дескриптору: у них могут быть открытые данные, расшифрованные при отправке. */
+    private val tlsSockets = mutableMapOf<Int, TLSSocket>()
+
+    override fun socketsWithBufferedData(): List<Int> {
+        // Закрытые клиенты (их дескриптора нет в clients) забываются: номер дескриптора могут выдать новому сокету
+        tlsSockets.keys.retainAll(clients.keys)
+        return tlsSockets.filter { it.value.hasBufferedData }.map { it.key }
+    }
+
     override fun accept(socket: Int, type: TCPSocketType) {
         try {
             val engine = TLSServerEngine(tlsServerContext)
             val sock = TLSSocket(socket, engine, writeRequest, buffer)
+            tlsSockets[socket] = sock
             clients[socket] = when (type) {
                 TCPSocketType.MQTT -> ClientConnection(sock, broker)
                 TCPSocketType.MQTTWS -> ClientConnection(WebSocket(sock), broker)

@@ -11,6 +11,8 @@ import kotlinx.cinterop.convert
 import kotlinx.cinterop.usePinned
 import io.github.davidepianca98.send
 import io.github.davidepianca98.socket.IOException
+import io.github.davidepianca98.socket.PendingSendQueue
+import io.github.davidepianca98.socket.isTransientSocketError
 import io.github.davidepianca98.socket.SocketClosedException
 import io.github.davidepianca98.socket.SocketInterface
 
@@ -20,36 +22,39 @@ public actual open class Socket(
     private val buffer: ByteArray
 ) : SocketInterface {
 
-    private var pendingSendData = mutableListOf<UByteArray>()
+    /**
+     * Исходящие данные, которые сокет сейчас не принял. Порядок сохраняется: пока очередь не пуста,
+     * новые данные уходят только за ней, а не в обход.
+     */
+    private val pendingSendData = PendingSendQueue()
 
     actual override fun send(data: UByteArray) {
-        data.toByteArray().usePinned { pinned ->
-            val length = send(socket, pinned.addressOf(0), data.size, 0)
-            if (length < 0) {
-                val error = getErrno()
-                if (error == getEagain() || error == getEwouldblock()) {
-                    pendingSendData.add(data)
-                    writeRequest?.add(socket)
-                } else {
-                    close()
-                    throw IOException("Error in send $error")
-                }
-            } else if (length < data.size) {
-                pendingSendData.add(data.copyOfRange(length, data.size))
-                writeRequest?.add(socket)
-            }
-            pinned
-        }
+        if (!pendingSendData.submit(data, ::sendChunk)) requestWrite()
     }
 
     actual override fun sendRemaining() {
-        val sendData = mutableListOf<UByteArray>()
-        sendData.addAll(pendingSendData)
-        pendingSendData.clear()
-        sendData.forEach {
-            send(it)
-        }
+        if (!pendingSendData.drain(::sendChunk)) requestWrite()
     }
+
+    /** Попросить цикл брокера сообщить, когда сокет станет доступен на запись (без дублей в списке). */
+    private fun requestWrite() {
+        val requests = writeRequest ?: return
+        if (!requests.contains(socket)) requests.add(socket)
+    }
+
+    /** Одна попытка `send`: число принятых байтов, `0` — сокет сейчас не принимает (EAGAIN); иначе исключение. */
+    private fun sendChunk(data: UByteArray): Int {
+        if (data.isEmpty()) return 0
+        val length = data.toByteArray().usePinned { pinned -> send(socket, pinned.addressOf(0), data.size, 0) }
+        if (length >= 0) return length
+        val error = getErrno()
+        if (isTransient(error)) return 0
+        close()
+        throw IOException("Error in send $error")
+    }
+
+    /** `EAGAIN`/`EWOULDBLOCK` или потерянный код (0): повторить позже, соединение не закрывать. */
+    private fun isTransient(error: Int): Boolean = isTransientSocketError(error, getEagain(), getEwouldblock())
 
     actual override fun read(): UByteArray? {
         buffer.usePinned { pinned ->
@@ -64,7 +69,7 @@ public actual open class Socket(
                 }
                 else -> {
                     val error = getErrno()
-                    if (error != getEagain() && error != getEwouldblock()) {
+                    if (!isTransient(error)) {
                         close()
                         throw IOException("Error in recv: $error")
                     } else {

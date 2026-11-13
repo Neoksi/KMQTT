@@ -26,7 +26,11 @@ public actual open class Socket(
             try {
                 sendBuffer.put(byteArray)
             } catch (e: BufferOverflowException) {
-                sendBuffer = ByteBuffer.allocate(sendBuffer.capacity() + data.size)
+                // The buffer is in write mode: bytes accumulated but not yet written to the channel must survive the growth
+                val grown = ByteBuffer.allocate(sendBuffer.capacity() + byteArray.size)
+                sendBuffer.flip()
+                grown.put(sendBuffer)
+                sendBuffer = grown
                 sendBuffer.put(byteArray)
             }
             sendFromBuffer()
@@ -40,7 +44,9 @@ public actual open class Socket(
             try {
                 val count = channel.write(sendBuffer)
                 if (count < size) {
-                    key?.interestOps(SelectionKey.OP_WRITE)
+                    // Читать продолжаем: иначе PUBACK/PINGREQ медленного клиента не читаются до полной записи хвоста,
+                    // а время последнего принятого пакета (keep-alive брокера) не обновляется
+                    key?.interestOps(SelectionKey.OP_READ or SelectionKey.OP_WRITE)
                 } else {
                     key?.interestOps(SelectionKey.OP_READ)
                 }

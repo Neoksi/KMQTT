@@ -106,8 +106,10 @@ public actual fun MemScope.select(
     timeout: Long
 ): Int {
     val timeoutStruct = alloc<timeval>()
-    timeoutStruct.tv_sec = 0
-    timeoutStruct.tv_usec = timeout * 1000
+    // tv_usec должен быть меньше 1 000 000: целые секунды отдельно (как в set_*_socket_timeout)
+    val seconds = timeout.coerceAtLeast(0) / 1000
+    timeoutStruct.tv_sec = seconds.convert()
+    timeoutStruct.tv_usec = ((timeout.coerceAtLeast(0) - seconds * 1000) * 1000).convert()
     return select(__nfds, __readfds, __writefds, __exceptfds, timeoutStruct.ptr)
 }
 
@@ -137,6 +139,12 @@ public actual fun MemScope.set_recv_socket_timeout(__fd: Int, timeout: Long): In
     return setsockopt(__fd, SOL_SOCKET, SO_RCVTIMEO, timeoutStruct.ptr, sizeOf<timeval>().toUInt())
 }
 
+/**
+ * Адрес имени [name] для TCP: IPv4 предпочтительно, IPv6 — если IPv4-адресов у имени нет или это литерал
+ * IPv6 (в том числе в скобках, `[::1]`: скобки снимает [hostForResolve]). Семейство полученного адреса —
+ * [addressFamilyOf] по длине. Адрес копируется в память [MemScope] (живёт, пока жив скоуп вызывающего), список
+ * `addrinfo` сразу освобождается `freeaddrinfo`. `null` — имя не разрешилось.
+ */
 public actual fun MemScope.getaddrinfo(name: String, service: String?): Pair<CPointer<sockaddr>, UInt>? {
     val hints = alloc<addrinfo>()
     platform.posix.memset(hints.ptr, 0, sizeOf<addrinfo>().convert())
@@ -144,14 +152,33 @@ public actual fun MemScope.getaddrinfo(name: String, service: String?): Pair<CPo
     hints.ai_socktype = platform.posix.SOCK_STREAM
     hints.ai_protocol = platform.posix.IPPROTO_TCP
     val result = alloc<CPointerVar<addrinfo>>()
-    if (getaddrinfo(name, service, hints.ptr, result.ptr) == 0) {
-        return if (result.pointed != null && result.pointed?.ai_addr != null && result.pointed?.ai_addrlen != null) {
-            Pair(result.pointed?.ai_addr!!, result.pointed?.ai_addrlen!!)
-        } else {
-            null
+    result.value = null
+    if (getaddrinfo(hostForResolve(name), service, hints.ptr, result.ptr) != 0) return null
+    val head = result.value ?: return null
+    try {
+        var chosen: addrinfo? = null
+        var node: addrinfo? = head.pointed
+        while (node != null) {
+            val family = node.ai_family
+            val usable = node.ai_addr != null && node.ai_addrlen.toInt() > 0 &&
+                (family == platform.posix.AF_INET || family == platform.posix.AF_INET6)
+            if (usable) {
+                if (family == platform.posix.AF_INET) {
+                    chosen = node
+                    break
+                }
+                if (chosen == null) chosen = node
+            }
+            node = node.ai_next?.pointed
         }
+        val pick = chosen ?: return null
+        val length = pick.ai_addrlen.toInt()
+        val copy = allocArray<ByteVar>(length)
+        platform.posix.memcpy(copy, pick.ai_addr, length.convert())
+        return Pair(copy.reinterpret<sockaddr>(), length.toUInt())
+    } finally {
+        platform.posix.freeaddrinfo(head)
     }
-    return null
 }
 
 public actual fun fdSet(fd: Int, fdSet: CValuesRef<fd_set>) {
@@ -168,4 +195,10 @@ public actual fun fdIsSet(fd: Int, fdSet: CValuesRef<fd_set>): Int {
 
 public actual fun gettimeofday(timeval: timeval) {
     platform.posix.gettimeofday(timeval.ptr, null)
+}
+
+public actual fun MemScope.setIpv6Only(__fd: Int, only: Boolean): Int {
+    val value = alloc<IntVar>()
+    value.value = if (only) 1 else 0
+    return setsockopt(__fd, platform.posix.IPPROTO_IPV6, platform.posix.IPV6_V6ONLY, value.ptr, sizeOf<IntVar>().toUInt())
 }

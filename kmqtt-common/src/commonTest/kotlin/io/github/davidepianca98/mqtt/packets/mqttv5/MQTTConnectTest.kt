@@ -102,4 +102,22 @@ class MQTTConnectTest {
         assertEquals(packet.connectFlags.willFlag, true)
         assertEquals(packet.connectFlags.willQos, Qos.EXACTLY_ONCE)
     }
+
+    // will без willProperties раньше давал NPE -> MALFORMED_PACKET; теперь пустые свойства will
+    @Test
+    fun willWithoutWillPropertiesSerializesAsEmptyProperties() {
+        val flags = ConnectFlags(false, false, false, Qos.AT_MOST_ONCE, true, true, false)
+        val payload = "abcd".encodeToByteArray().toUByteArray()
+        val withoutProperties = MQTT5Connect(
+            "MQTT", flags, 60, clientID = "c", willTopic = "/test/will", willPayload = payload
+        )
+        val withEmptyProperties = MQTT5Connect(
+            "MQTT", flags, 60, clientID = "c", willProperties = MQTT5Properties(),
+            willTopic = "/test/will", willPayload = payload
+        )
+        assertTrue(withEmptyProperties.toByteArray().contentEquals(withoutProperties.toByteArray()))
+        val parsed = MQTT5Connect.fromByteArray(0, withoutProperties.toByteArray().copyOfRange(2, withoutProperties.toByteArray().size))
+        assertEquals("/test/will", parsed.willTopic)
+        assertTrue(parsed.willPayload!!.contentEquals(payload))
+    }
 }

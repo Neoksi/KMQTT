@@ -97,7 +97,14 @@ public expect fun MemScope.select(
     timeout: Long
 ): Int
 
+/**
+ * Адрес имени для TCP: IPv4 предпочтительно, IPv6 — если IPv4 у имени нет или это литерал IPv6 (в том числе `[::1]`),
+ * Длина отличает семейство ([addressFamilyOf]); сокет создаётся этого семейства. `null` — не разрешилось.
+ */
 public expect fun MemScope.getaddrinfo(name: String, service: String?): Pair<CPointer<sockaddr>, UInt>?
+
+/** `IPV6_V6ONLY` сокета `AF_INET6`: `false` — слушающий `::` принимает и IPv4. 0 или -1 (ошибка). */
+public expect fun MemScope.setIpv6Only(__fd: Int, only: Boolean): Int
 
 public expect fun fdSet(fd: Int, fdSet: CValuesRef<fd_set>)
 

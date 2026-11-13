@@ -26,6 +26,9 @@ import io.github.davidepianca98.socket.udp.UDPSocket
 import io.github.davidepianca98.socketsCleanup
 import io.github.davidepianca98.socketsInit
 import io.github.davidepianca98.accept as posixAccept
+import io.github.davidepianca98.addressFamilyOf
+import io.github.davidepianca98.getaddrinfo
+import io.github.davidepianca98.setIpv6Only
 
 internal actual open class ServerSocket actual constructor(
     private val broker: Broker,
@@ -49,7 +52,25 @@ internal actual open class ServerSocket actual constructor(
     private val writefds = nativeHeap.alloc<fd_set>()
     private val errorfds = nativeHeap.alloc<fd_set>()
 
-    private fun prepareStreamSocket(socket: Int, port: Int) = memScoped {
+    /**
+     * Слушающий TCP-сокет на [Broker.host]:[port]: адрес разрешается `getaddrinfo` (IPv4 предпочтительно),
+     * семейство сокета — по адресу. По умолчанию `0.0.0.0` — все адреса IPv4, как раньше; `::` — все адреса IPv6 и
+     * IPv4 (`IPV6_V6ONLY` = 0 явно: умолчания Linux и Windows разные), `::1`/`[::1]` — петля IPv6. Раньше native-брокер
+     * `host` не читал и всегда слушал `0.0.0.0`.
+     */
+    private fun openStreamSocket(port: Int): Int = memScoped {
+        val address = getaddrinfo(broker.host, port.toString())
+        if (address == null) {
+            socketsCleanup()
+            throw IOException("Failed resolving address")
+        }
+        val family = addressFamilyOf(address.second)
+        val socket = socket(family, SOCK_STREAM, 0)
+        if (socket == -1) {
+            socketsCleanup()
+            throw IOException("Invalid socket: error $errno")
+        }
+
         val reuseAddr = alloc<uint32_tVar>()
         reuseAddr.value = 1u
         if (setsockopt(socket, SOL_SOCKET, SO_REUSEADDR, reuseAddr.ptr, 4u) == -1) {
@@ -57,9 +78,12 @@ internal actual open class ServerSocket actual constructor(
             throw IOException("Setsockopt")
         }
 
-        val serverAddress = sockaddrIn(AF_INET.convert(), port.convert())
+        if (family == AF_INET6 && setIpv6Only(socket, false) == -1) {
+            socketsCleanup()
+            throw IOException("Setsockopt IPV6_V6ONLY")
+        }
 
-        if (bind(socket, serverAddress.ptr.reinterpret(), sizeOf<sockaddr_in>().convert()) == -1) {
+        if (bind(socket, address.first, address.second) == -1) {
             socketsCleanup()
             throw IOException("Failed bind")
         }
@@ -73,8 +97,10 @@ internal actual open class ServerSocket actual constructor(
             socketsCleanup()
             throw IOException("Failed listen")
         }
+        socket
     }
 
+    /** UDP (MQTT-SN, обнаружение кластера) — по-прежнему только IPv4, все адреса (`0.0.0.0`), [Broker.host] не читается. */
     private fun prepareDatagramSocket(socket: Int, port: Int) = memScoped {
         val serverAddress = sockaddrIn(AF_INET.convert(), port.convert())
 
@@ -99,12 +125,7 @@ internal actual open class ServerSocket actual constructor(
     init {
         memScoped {
             socketsInit()
-            mqttSocket = socket(AF_INET, SOCK_STREAM, 0)
-            if (mqttSocket == -1) {
-                socketsCleanup()
-                throw IOException("Invalid socket: error $errno")
-            }
-            prepareStreamSocket(mqttSocket, broker.port)
+            mqttSocket = openStreamSocket(broker.port)
 
             if (broker.enableUdp) {
                 mqttUdpSocket = socket(AF_INET, SOCK_DGRAM, 0)
@@ -117,22 +138,12 @@ internal actual open class ServerSocket actual constructor(
             }
 
             if (broker.webSocketPort != null) {
-                mqttWebSocket = socket(AF_INET, SOCK_STREAM, 0)
-                if (mqttWebSocket == -1) {
-                    socketsCleanup()
-                    throw IOException("Invalid socket: error $errno")
-                }
-                prepareStreamSocket(mqttWebSocket, broker.webSocketPort)
+                mqttWebSocket = openStreamSocket(broker.webSocketPort)
             }
 
             if (broker.cluster != null) {
                 val cluster = broker.cluster
-                clusteringSocket = socket(AF_INET, SOCK_STREAM, 0)
-                if (clusteringSocket == -1) {
-                    socketsCleanup()
-                    throw IOException("Invalid socket: error $errno")
-                }
-                prepareStreamSocket(clusteringSocket, cluster.tcpPort)
+                clusteringSocket = openStreamSocket(cluster.tcpPort)
 
                 if (!cluster.dnsDiscovery) {
                     discoverySocket = socket(AF_INET, SOCK_DGRAM, 0)
@@ -200,13 +211,15 @@ internal actual open class ServerSocket actual constructor(
             writeRequest.forEach {
                 posix_FD_SET(it.convert(), writefds.ptr)
             }
+            // Сокет с уже расшифрованными, но не прочитанными данными не ждёт: select без ожидания
+            val buffered = socketsWithBufferedData()
             memScoped {
                 select(
                     maxFd + 1,
                     readfds.ptr,
                     writefds.ptr,
                     errorfds.ptr,
-                    timeout
+                    if (buffered.isEmpty()) timeout else 0
                 )
             }
 
@@ -245,8 +258,22 @@ internal actual open class ServerSocket actual constructor(
                     }
                 }
             }
+            buffered.forEach { fd ->
+                val attachment = clients[fd]
+                // Сокет мог закрыться или уже прочитать накопленное в этом же обороте (признак сброшен)
+                if (attachment != null && socketsWithBufferedData().contains(fd)) {
+                    if (!selectCallback(attachment, SocketState.READ))
+                        clients.remove(fd)
+                }
+            }
         }
     }
+
+    /**
+     * Сокеты клиентов, у которых есть уже полученные открытые данные, не отданные `read()` (TLS): их нужно
+     * прочитать, не дожидаясь готовности дескриптора. У TCP без TLS таких нет.
+     */
+    protected open fun socketsWithBufferedData(): List<Int> = emptyList()
 
     enum class TCPSocketType {
         MQTT,

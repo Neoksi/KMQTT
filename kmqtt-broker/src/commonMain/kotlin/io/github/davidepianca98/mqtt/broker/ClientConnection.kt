@@ -166,7 +166,24 @@ public class ClientConnection(
         clientId?.let { broker.connectionCallbacks?.onDisconnect(it, false) }
     }
 
+    /**
+     * Код возврата CONNACK MQTT 3.1.1 для причины отказа в подключении; `null` - для 3.1.1 такой причины нет (ошибка
+     * протокола и прочее: соединение закрывается без CONNACK, MQTT 3.1.1 3.1.4).
+     */
+    private fun ReasonCode.toConnectReturnCode(): ConnectReturnCode? = when (this) {
+        ReasonCode.NOT_AUTHORIZED -> ConnectReturnCode.NOT_AUTHORIZED
+        ReasonCode.BAD_USER_NAME_OR_PASSWORD -> ConnectReturnCode.BAD_USERNAME_PASSWORD
+        ReasonCode.UNSUPPORTED_PROTOCOL_VERSION -> ConnectReturnCode.UNACCEPTABLE_PROTOCOL_VERSION
+        ReasonCode.CLIENT_IDENTIFIER_NOT_VALID -> ConnectReturnCode.IDENTIFIER_REJECTED
+        ReasonCode.SERVER_UNAVAILABLE, ReasonCode.SERVER_BUSY -> ConnectReturnCode.SERVER_UNAVAILABLE
+        else -> null
+    }
+
     public fun disconnect(reasonCode: ReasonCode, serverReference: String? = null) {
+        if (currentReceivedPacket.mqttVersion == MQTTVersion.MQTT3_1_1 && !connectCompleted) {
+            // отказ до CONNACK (неверный логин или пароль) - клиент должен получить код возврата, а не обрыв
+            reasonCode.toConnectReturnCode()?.let { writePacket(MQTT4Connack(ConnectAcknowledgeFlags(false), it)) }
+        }
         if (currentReceivedPacket.mqttVersion == MQTTVersion.MQTT5) {
             if (!connectCompleted) {
                 val connack = MQTT5Connack(
@@ -715,9 +732,11 @@ public class ClientConnection(
                 if (!(subscription.options.noLocal && session!!.clientId == clientId)) {
                     val qos = Qos.min(retainedMessage.qos, subscription.options.qos)
 
+                    // MQTT-3.3.1-8: a retained message sent on a new subscription always has RETAIN set to 1
+                    // (Retain As Published only affects messages forwarded after the subscription)
                     if (currentReceivedPacket.mqttVersion == MQTTVersion.MQTT5) {
                         retainedMessagesList += MQTT5Publish(
-                            if (subscription.options.retainedAsPublished) retainedMessage.retain else false,
+                            true,
                             qos,
                             false,
                             retainedMessage.topicName,
@@ -727,7 +746,7 @@ public class ClientConnection(
                         )
                     } else {
                         retainedMessagesList += MQTT4Publish(
-                            if (subscription.options.retainedAsPublished) retainedMessage.retain else false,
+                            true,
                             qos,
                             false,
                             retainedMessage.topicName,

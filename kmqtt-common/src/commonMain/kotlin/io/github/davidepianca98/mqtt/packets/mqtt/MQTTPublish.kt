@@ -9,6 +9,11 @@ import io.github.davidepianca98.mqtt.packets.mqttv5.MQTT5Publish
 import io.github.davidepianca98.socket.streams.ByteArrayInputStream
 import io.github.davidepianca98.socket.streams.decodeVariableByteInteger
 
+/**
+ * @param timestamp время создания пакета в миллисекундах (для истечения срока жизни сообщения). По умолчанию —
+ *   текущее системное время [currentTimeMillis]; код, у которого есть собственные часы (ядро нового клиента,
+ *   тесты на виртуальном времени), передаёт время явно.
+ */
 public abstract class MQTTPublish(
     public val retain: Boolean,
     public val qos: Qos = Qos.AT_MOST_ONCE,
